@@ -1,0 +1,15 @@
+# Q-Net Lab — зависимости. Python 3.10+ (проверено на Python 3.13 / Windows 11).
+# Установка (Terminal в PyCharm):
+#   python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   python -m pip install -r requirements.txt
+#
+# Проверено: Python 3.14.6 (Anaconda 2026.07), torch 2.14.1+cpu, PyQt6 6.11 / Qt 6.11.2.
+# Для Python из Anaconda main.py заранее загружает системную ICU Windows (см. preload_system_icu).
+numpy>=1.26,<3
+scipy>=1.11,<2
+pandas>=2.1,<4
+matplotlib>=3.8,<4
+seaborn>=0.13,<1
+torch>=2.6,<3
+PyQt6>=6.7,<7
+cryptography>=42,<51

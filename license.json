@@ -1,0 +1,12 @@
+{
+  "payload": {
+    "product": "Q-Net Lab",
+    "format_version": "1",
+    "subject": "Q-Net Lab — лаборатория (демонстрационная лицензия)",
+    "license_id": "88c23c3a-2018-43d7-bfcd-437a8a45b02e",
+    "issued_at": "2026-10-23T21:14:47Z",
+    "not_before": "2026-10-23T21:14:47Z",
+    "expires_at": "2027-10-23T21:14:47Z"
+  },
+  "signature": "x3VswNR2B2aQuDC75YoprszVOPfLuJPzPMFLrcupGSn1te56VIGe2H5XWLyqXN9oj0buqqaD6+wqI55j0VUlJ9qCbGo/6xZKf0KsiBrGSxPzBu8YT9OBAPh3x9BjwA1niEKzF2GLmthji6JT4nNHul4wS5OyPR3bw0yBgVCC7NLB4mpTeck2ldXDucOxjh1O7W+3D+JYd8gzE4UrwOJMBW0PEzrStxeZCZvjl6AtzD8F+wky206l2uWkxrOGoswy3BH6t+DJCReKelt6dHmyVH+bdAXmOFl1kydnAMB2tGXln98OumzNNzpz2Ng01DO6FxRM6mhM0H3Mxt2WYJekozHiyMnZZWOjEwfO70lXUSur/w1FKhhvuhKczA2H6RqudI3reQPiom+GE3W3GicfbdPIlUXfgQzkZ+hDSBAQ4xkj4z2qLLFPtaF6FQus3WBI7NLIVsVmTadS2Z+wsPyS11VyPJ3mK26bBq5H4wvaZh+Udk9dtBnoY/aoURd5FqcI"
+}
