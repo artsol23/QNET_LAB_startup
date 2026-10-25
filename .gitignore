@@ -20,3 +20,9 @@ dist/
 
 startup-*.txt
 
+*.iss
+make_installer.bat
+installer-output/
+
+
+
