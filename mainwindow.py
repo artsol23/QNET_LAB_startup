@@ -78,11 +78,6 @@ from PyQt6.QtWidgets import (
     QTextEdit, QVBoxLayout, QWidget,
 )
 
-try:  # Seaborn (ТЗ, п. 4.2) используется для матриц ошибок; без него — matplotlib.
-    import seaborn as sns
-except ImportError:  # pragma: no cover
-    sns = None
-
 from neural_service import NeuralService
 
 
@@ -2110,6 +2105,11 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _heatmap(ax, entry, compact=False):
+        try:  # Seaborn (ТЗ, п. 4.2) используется для матриц ошибок; без него — matplotlib.
+            import seaborn as sns
+        except ImportError:  # pragma: no cover
+            sns = None
+
         cm = np.asarray(entry["confusion"], float)
         norm = cm / np.maximum(cm.sum(1, keepdims=True), 1)
         # В компактном виде (много атомов) — только доли, иначе доля и число трасс.
