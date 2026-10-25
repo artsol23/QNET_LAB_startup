@@ -2,6 +2,8 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
+set "PROJECT_DIR=%CD%"
+
 rem Build settings
 set "BASE_PY=.venv\Scripts\python.exe"
 set "TORCH_VERSION=2.14.1"
@@ -145,12 +147,12 @@ echo Building executable...
     --distpath "%DIST_DIR%" ^
     --workpath "build\%FLAVOR%" ^
     --specpath "build\spec-%FLAVOR%" ^
-    --add-data "public_key.pem:." ^
-    --add-data "license.json:." ^
-    --add-data "UserGuide.html:." ^
-    --add-data "README.txt:." ^
-    --add-data "examples:examples" ^
-    main.py
+    --add-data "%PROJECT_DIR%\public_key.pem:." ^
+    --add-data "%PROJECT_DIR%\license.json:." ^
+    --add-data "%PROJECT_DIR%\UserGuide.html:." ^
+    --add-data "%PROJECT_DIR%\README.txt:." ^
+    --add-data "%PROJECT_DIR%\examples:examples" ^
+    "%PROJECT_DIR%\main.py"
 if errorlevel 1 exit /b 1
 
 if not exist "%DIST_DIR%\QNetLab\QNetLab.exe" (
@@ -182,7 +184,8 @@ echo BUILD COMPLETED
 echo Output directory: %CD%\dist
 echo Test the executables before distribution.
 echo ==================================================
-pause
+echo Press any key to close...
+pause >nul
 exit /b 0
 
 
@@ -193,5 +196,6 @@ echo BUILD FAILED
 echo Read the error message above.
 echo Do not distribute output from the failed build.
 echo ==================================================
-pause
+echo Press any key to close...
+pause >nul
 exit /b 1
