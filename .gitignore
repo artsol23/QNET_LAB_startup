@@ -11,8 +11,8 @@ __pycache__/
 .pytest_cache/
 
 # Build artifacts
-#build/
-#dist/
+build/
+dist/
 *.spec
 
 # IDE
