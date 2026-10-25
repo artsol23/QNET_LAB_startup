@@ -91,12 +91,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
-import pandas as pd
 import torch
-from scipy.cluster.vq import kmeans2
-from scipy.ndimage import convolve1d
-from scipy.optimize import linear_sum_assignment
-from scipy.special import ndtr
 from torch import nn
 
 from device_runtime import resolve_device, prepare_model_transfer
@@ -440,6 +435,8 @@ class NeuralService:
 
     def _read_csv(self, path: Path) -> dict:
         """Разобрать CSV в «длинном» или «широком» формате (см. load_data)."""
+        import pandas as pd
+
         try:
             with path.open("r", encoding="utf-8-sig", newline="") as handle:
                 head = handle.read(65536)
@@ -647,6 +644,8 @@ class NeuralService:
 
     def _prepare(self, iq: np.ndarray, config=None) -> np.ndarray:
         """Выбрать атомы, вырезать окно и применить свёртку к батчу [B, A, T]."""
+        from scipy.ndimage import convolve1d
+
         config = config or self.config
         x = iq[:, config["atoms"], :]
         window = config["filter_config"]["window"]
@@ -977,6 +976,9 @@ class NeuralService:
             "indices", "cluster_sizes", "mapping", "leaked_level", "warnings",
             "leaked_count", "agreement", "mtv"}``.
         """
+        from scipy.cluster.vq import kmeans2
+        from scipy.optimize import linear_sum_assignment
+
         data = self._check_data(data)
         if data["labels"] is None:
             raise ValueError("Для поиска утечки нужны метки подготовленных состояний.")
@@ -1634,6 +1636,8 @@ class NeuralService:
         облаков при пороге посередине и равных априорных вероятностях:
         ½[Φ(−Δ/(2σ_i)) + Φ(−Δ/(2σ_j))] (при σ_i = σ_j это Φ(−SNR/2)).
         """
+        from scipy.special import ndtr
+
         out = []
         for i, j in itertools.combinations(range(k), 2):
             a, b = pts[y == i], pts[y == j]
