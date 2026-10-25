@@ -99,6 +99,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.special import ndtr
 from torch import nn
 
+from device_runtime import resolve_device, prepare_model_transfer
 
 class NeuralService:
     """Сервис текущей нейросети: данные → фильтры → FNN → метрики.
@@ -155,9 +156,8 @@ class NeuralService:
             есть видеокарта с CUDA и установлена соответствующая сборка PyTorch.
         :raises ValueError: если запрошена CUDA, но она недоступна.
         """
-        self.device = torch.device(device)
-        if self.device.type == "cuda" and not torch.cuda.is_available():
-            raise ValueError("CUDA недоступна. Выберите устройство cpu.")
+        self.device = resolve_device(device)
+        self.device_note = ""
         # Текущее состояние классификатора. Ничего другого объект не хранит.
         self.config: dict[str, Any] = {}
         self.model: nn.Module | None = None
@@ -174,6 +174,63 @@ class NeuralService:
         self.update_steps = 0
         self._fitted = False
         self.configure(levels=[2], hidden_layers=None)
+
+    def set_device(self, mode: str) -> str:
+        """Выбрать устройство между вычислительными задачами.
+
+        mode:
+            cpu     — только CPU;
+            cuda:0  — первая NVIDIA GPU, при ошибке отказ;
+            auto    — попробовать GPU, при ошибке выбрать CPU.
+
+        Вызывать только при отсутствии выполняющихся вычислений.
+        """
+        if mode not in {"cpu", "cuda", "cuda:0", "auto"}:
+            raise ValueError(f"Неизвестный режим устройства: {mode}")
+
+        def transfer(target):
+            if target == self.device:
+                return
+
+            model, state = prepare_model_transfer(
+                self.model,
+                self.optimizer_state,
+                target,
+            )
+
+            # Исходное состояние заменяется только после успеха.
+            self.model = model
+            self.optimizer_state = state
+            self.device = target
+
+        if mode == "auto":
+            try:
+                target = resolve_device("cuda:0")
+                transfer(target)
+            except (RuntimeError, ValueError) as exc:
+                # Переход выполняется до начала обучения.
+                transfer(torch.device("cpu"))
+                self.device_note = (
+                    f"Автоматически выбран CPU. Причина: {exc}"
+                )
+            else:
+                self.device_note = (
+                    "Автоматически выбран GPU: "
+                    f"{torch.cuda.get_device_name(self.device)}"
+                )
+
+        else:
+            target = resolve_device(mode)
+            transfer(target)
+
+            if target.type == "cuda":
+                self.device_note = (
+                    f"GPU: {torch.cuda.get_device_name(target)}"
+                )
+            else:
+                self.device_note = "Выбран CPU."
+
+        return str(self.device)
 
     @property
     def is_fitted(self) -> bool:

@@ -50,6 +50,8 @@ macro-F1, XEB, матрица ошибок). Каждый график вклю�
 """
 from __future__ import annotations
 
+from app_version import APP_VERSION
+
 import csv
 import hashlib
 import json
@@ -141,7 +143,7 @@ class MainWindow(QMainWindow):
         self._close_after_task = False
         self._redraw_pending = False
 
-        self.setWindowTitle("Q-Net Lab — распознавание состояний кубитов и кудитов")
+        self.setWindowTitle(f"Q-Net Lab {APP_VERSION} — распознавание состояний кубитов и кудитов")
         self.resize(1480, 940)
         self.setMinimumSize(1100, 720)
         self._build_ui()
@@ -153,6 +155,8 @@ class MainWindow(QMainWindow):
         self._set_mode(False)
         self._update_header()
         self._log(f"Запуск Q-Net Lab. {self.license_info.get('message', '')}")
+
+        QTimer.singleShot(0, self.change_device)
 
     # ------------------------------------------------------------------
     # Компоновка
@@ -187,11 +191,40 @@ class MainWindow(QMainWindow):
             button.setToolTip(tip)
             button.clicked.connect(slot)
             bar.addWidget(button)
+
         top.addWidget(self.project_bar)
         top.addStretch()
         self.project_label = QLabel()
         top.addWidget(self.project_label)
         root.addLayout(top)
+
+        self.device_bar = QWidget()
+        device_layout = QHBoxLayout(self.device_bar)
+        device_layout.setContentsMargins(0, 0, 0, 0)
+
+        device_layout.addWidget(QLabel("Вычисления:"))
+
+        self.device_combo = QComboBox()
+        self.device_combo.addItem("Автоматически", "auto")
+        self.device_combo.addItem("CPU", "cpu")
+        self.device_combo.addItem("GPU NVIDIA", "cuda:0")
+        device_layout.addWidget(self.device_combo)
+
+        self.device_button = QPushButton("Применить")
+        self.device_button.clicked.connect(self.change_device)
+        device_layout.addWidget(self.device_button)
+
+        self.device_status = QLabel(
+            f"Используется: {self.service.device}"
+        )
+        device_layout.addWidget(self.device_status)
+        device_layout.addStretch()
+
+        root.addWidget(self.device_bar)
+
+        self._applied_device_mode = str(self.service.device)
+        if self._applied_device_mode == "cuda":
+            self._applied_device_mode = "cuda:0"
 
         self.pages = QStackedWidget()
         self.pages.addWidget(self._training_page())
@@ -213,6 +246,44 @@ class MainWindow(QMainWindow):
         help_action = QAction("Справка", self)
         help_action.triggered.connect(self._show_help)
         self.menuBar().addAction(help_action)
+
+    def change_device(self):
+        """Переключить устройство в рабочем потоке."""
+        if self._busy:
+            return
+
+        requested = self.device_combo.currentData()
+        service = self.service
+
+        def work():
+            try:
+                actual = service.set_device(requested)
+                return requested, actual, service.device_note, None
+            except Exception as exc:
+                return requested, str(service.device), "", exc
+
+        self._run(
+            "Выбор вычислительного устройства",
+            work,
+            self._device_changed,
+        )
+
+    def _device_changed(self, payload):
+        """Обновить интерфейс в главном потоке."""
+        requested, actual, note, error = payload
+
+        self.device_status.setText(f"Используется: {actual}")
+
+        if error is not None:
+            index = self.device_combo.findData(
+                self._applied_device_mode
+            )
+            self.device_combo.setCurrentIndex(max(index, 0))
+            self._error(error, "Не удалось переключить устройство")
+            return
+
+        self._applied_device_mode = requested
+        self._log(note)
 
     @staticmethod
     def _scroll(widget: QWidget) -> QScrollArea:
@@ -799,7 +870,7 @@ class MainWindow(QMainWindow):
             raise RuntimeError("Дождитесь завершения текущей операции.")
         self._busy = True
         self._cancel.clear()
-        for widget in (self.train_tabs, self.val_tabs, self.project_bar, self.mode_button):
+        for widget in (self.train_tabs, self.val_tabs, self.project_bar, self.mode_button, self.device_bar,):
             widget.setEnabled(False)
         self.stop_button.setEnabled(cancellable)
         self.progress.setRange(0, steps if steps else 0)
@@ -832,7 +903,7 @@ class MainWindow(QMainWindow):
             elif message[0] == "done":
                 _, done, result, error = message
                 self._busy = False
-                for widget in (self.train_tabs, self.val_tabs, self.project_bar, self.mode_button):
+                for widget in (self.train_tabs, self.val_tabs, self.project_bar, self.mode_button, self.device_bar,):
                     widget.setEnabled(True)
                 self.stop_button.setEnabled(False)
                 self.progress.setRange(0, 100)
@@ -890,7 +961,7 @@ class MainWindow(QMainWindow):
         self.history, self.train_eval, self.result, self.diagnostics, self.leakage = [], None, None, None, None
         self.current_weights = None
         self.model_fingerprint = None
-        self.service = NeuralService()
+        self.service = NeuralService(device=str(self.service.device))
         self.train_info.setText("Данные не загружены")
         self.eval_info.setText("Данные не загружены")
         self.split_info.setText("Разделение не выполнено")
@@ -956,13 +1027,15 @@ class MainWindow(QMainWindow):
         if not selected:
             return
 
+        device_name = str(self.service.device)
+
         def read():
             path = Path(selected).resolve()
             manifest = json.loads(path.read_text(encoding="utf-8"))
             if manifest.get("format") != self.PROJECT_FORMAT or manifest.get("version") != self.PROJECT_VERSION:
                 raise ValueError("Это не проект Q-Net Lab этой версии.")
             folder = path.parent
-            restored = {"folder": folder, "manifest": manifest, "service": NeuralService(), "data": {}, "warnings": []}
+            restored = {"folder": folder, "manifest": manifest, "service": NeuralService(device=device_name), "data": {}, "warnings": []}
             for role, entry in manifest.get("datasets", {}).items():
                 try:
                     restored["data"][role] = self._read_dataset(folder, entry, restored["warnings"])
