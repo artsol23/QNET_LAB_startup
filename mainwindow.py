@@ -5,13 +5,15 @@ mainwindow.py — главное окно Q-Net Lab. В файле ровно о
 
 Разделение ответственности
 ==========================
-* :class:`neural_service.NeuralService` — математика: данные, фильтры, сеть,
-  метрики. Хранит только ТЕКУЩУЮ модель, ничего не пишет на диск сам.
-* :class:`MainWindow` — интерфейс и ВСЕ файлы. Пользователь создаёт проект
-  (выбирает папку в диалоге), и всё — журналы, наборы весов разных дней,
-  копии данных, отчёты, параметры — хранится в этой папке и только в ней.
-  Загрузить ранее сохранённые веса можно кнопкой «Загрузить веса» или из
-  списка на вкладке «Дообучение»; тогда меняются веса в сервисе.
+* neural_service.NeuralService — данные, фильтры, сеть, обучение,
+  метрики, загрузка и сохранение весов.
+* MainWindow — интерфейс, состояние текущей сессии и координация
+  пользовательских действий.
+* project_store.ProjectStore — пути проекта, запись JSON,
+  контроль целостности и восстановление файлов данных.
+* task_runner.TaskRunner — выполнение фоновых задач, очередь сообщений
+  и сигнал отмены.
+* plotting — построение графиков по готовым данным.
 
 Структура папки проекта::
 
@@ -56,16 +58,12 @@ import csv
 import hashlib
 import json
 import logging
-import math
 import shutil
-import threading
 import traceback
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from queue import Empty, Queue
+import copy
 
-import matplotlib
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
@@ -78,7 +76,12 @@ from PyQt6.QtWidgets import (
     QTextEdit, QVBoxLayout, QWidget,
 )
 
+import plotting
 from neural_service import NeuralService
+from project_store import ProjectStore
+from task_runner import TaskRunner
+from training_history import HISTORY_KEYS, clean_history, read_history
+from result_export import write_predictions_csv, write_report_json
 
 
 class MainWindow(QMainWindow):
@@ -87,6 +90,7 @@ class MainWindow(QMainWindow):
     PROJECT_FORMAT = "qnetlab-project"
     PROJECT_VERSION = 2
     MAX_ATOMS_SHOWN = 5
+
     #: Метрики обучения: ключ истории → (подпись, ключ train, ключ validation).
     TRAIN_CHARTS = {
         "loss": ("Loss (cross-entropy)", "loss", "val_loss"),
@@ -96,8 +100,7 @@ class MainWindow(QMainWindow):
         "xeb": ("XEB", None, "val_xeb"),
         "confusion": ("Матрица ошибок (validation)", None, None),
     }
-    HISTORY_KEYS = ("epoch", "loss", "accuracy", "val_loss", "val_accuracy", "val_assignment_fidelity",
-                    "val_macro_f1", "val_xeb", "val_xeb_linear", "lr")
+    HISTORY_KEYS = HISTORY_KEYS
     VALIDATION_VIEWS = ("Пятна IQ", "Матрицы ошибок", "Бенчмарки", "Распад и температура",
                         "Гистограммы фильтров", "Ядра фильтров", "Кривые IQ")
 
@@ -121,6 +124,7 @@ class MainWindow(QMainWindow):
         self.history: list[dict] = []             # история эпох текущей модели
         self.train_eval: dict | None = None       # validate() на validation после обучения
         self.result: dict | None = None           # последний validate()/infer()
+        self.result_metadata: dict | None = None
         self.result_source = ""                   # описание набора для отчётов
         self.diagnostics: dict | None = None      # filter_diagnostics()
         self.leakage: dict | None = None          # предложение find_leakage()
@@ -130,12 +134,12 @@ class MainWindow(QMainWindow):
         self._pending_log: list[tuple[int, str]] = []   # журнал до создания проекта
         self._logger: logging.Logger | None = None
         self._run_log: str | None = None          # CSV эпох текущего запуска
-        # --- рабочий поток ---
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qnetlab")
-        self._queue: Queue = Queue()
-        self._cancel = threading.Event()
+        # --- фоновые задачи ---
+        self._tasks = TaskRunner()
         self._busy = False
+
         self._close_after_task = False
+        self._close_confirmed = False
         self._redraw_pending = False
 
         self.setWindowTitle(f"Q-Net Lab {APP_VERSION} — распознавание состояний кубитов и кудитов")
@@ -797,120 +801,133 @@ class MainWindow(QMainWindow):
         if self.project_dir is None:
             raise ValueError("Сначала создайте или откройте проект: все файлы хранятся в его папке.")
 
-    @staticmethod
-    def _stamp() -> str:
-        return datetime.now().strftime("%Y%m%d_%H%M%S")
-
     def _unique(self, folder: str, prefix: str, suffix: str) -> Path:
-        """Уникальное имя файла внутри подпапки проекта (дата и время в имени)."""
-        base = self.project_dir / folder
-        base.mkdir(exist_ok=True)
-        path = base / f"{prefix}_{self._stamp()}{suffix}"
-        counter = 1
-        while path.exists():
-            path = base / f"{prefix}_{self._stamp()}_{counter}{suffix}"
-            counter += 1
-        return path
+        return ProjectStore(self.project_dir).unique_path(
+            folder,
+            prefix,
+            suffix,
+        )
 
     def _relative(self, path: Path) -> str:
-        return path.resolve().relative_to(self.project_dir).as_posix()
+        return ProjectStore(self.project_dir).relative_path(path)
 
     def _inside(self, relative: str) -> Path:
-        """Путь из manifest → абсолютный путь, не выходящий за пределы проекта."""
-        path = (self.project_dir / relative).resolve()
-        if self.project_dir != path and self.project_dir not in path.parents:
-            raise ValueError(f"Путь {relative} выходит за пределы папки проекта.")
-        return path
+        return ProjectStore(self.project_dir).inside(relative)
 
-    @staticmethod
-    def _sha256(path: Path) -> str:
-        digest = hashlib.sha256()
-        with open(path, "rb") as stream:
-            for block in iter(lambda: stream.read(1 << 20), b""):
-                digest.update(block)
-        return digest.hexdigest()
-
-    @staticmethod
-    def _jsonable(value):
-        """Привести numpy-значения к типам, которые понимает json."""
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-        if isinstance(value, np.generic):
-            return value.item()
-        if isinstance(value, dict):
-            return {str(k): MainWindow._jsonable(v) for k, v in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [MainWindow._jsonable(v) for v in value]
-        if isinstance(value, float) and not math.isfinite(value):
-            return None
-        return value
+    _sha256 = staticmethod(ProjectStore.sha256)
+    _jsonable = staticmethod(ProjectStore.jsonable)
 
     def _write_json(self, path: Path, payload):
-        """Атомарная запись JSON: временный файл → переименование."""
-        temporary = path.with_name(path.name + ".tmp")
-        temporary.write_text(json.dumps(self._jsonable(payload), ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        ProjectStore(self.project_dir).write_json(path, payload)
 
     # ==================================================================
     # Фоновые задачи
     # ==================================================================
-    def _run(self, title: str, work, done, *, cancellable=False, steps=0):
-        """Выполнить ``work()`` в рабочем потоке; ``done(result)`` — в главном.
+    def _set_task_ui(
+        self,
+        busy: bool,
+        *,
+        cancellable: bool = False,
+        steps: int = 0,
+    ):
+        """Обновить элементы интерфейса при запуске/завершении задачи."""
+        self._busy = busy
 
-        Пока задача идёт, левые панели и кнопки проекта блокируются, чтобы
-        пользователь не изменил данные или модель во время расчёта. Флажки
-        графиков справа остаются доступными.
-        """
+        panels = (
+            self.train_tabs,
+            self.val_tabs,
+            self.project_bar,
+            self.mode_button,
+            self.device_bar,
+        )
+
+        for widget in panels:
+            widget.setEnabled(not busy)
+
+        self.stop_button.setEnabled(busy and cancellable)
+
+        if busy:
+            self.progress.setRange(0, steps if steps else 0)
+            self.progress.setValue(0)
+        else:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(100)
+
+    def _run(
+        self,
+        title: str,
+        work,
+        done,
+        *,
+        cancellable=False,
+        steps=0,
+    ):
+        """Запустить вычисление; обработать результат в главном потоке."""
         if self._busy:
-            raise RuntimeError("Дождитесь завершения текущей операции.")
-        self._busy = True
-        self._cancel.clear()
-        for widget in (self.train_tabs, self.val_tabs, self.project_bar, self.mode_button, self.device_bar,):
-            widget.setEnabled(False)
-        self.stop_button.setEnabled(cancellable)
-        self.progress.setRange(0, steps if steps else 0)
-        self.progress.setValue(0)
+            raise RuntimeError(
+                "Дождитесь завершения текущей операции."
+            )
+
+        self._set_task_ui(
+            True,
+            cancellable=cancellable,
+            steps=steps,
+        )
         self._log(f"{title}…")
 
-        def job():
-            try:
-                self._queue.put(("done", done, work(), None))
-            except Exception as exc:  # noqa: BLE001 — передаём исключение в главный поток
-                self._queue.put(("done", done, None, exc))
-        self._executor.submit(job)
+        try:
+            self._tasks.submit(work, done)
+        except Exception as exc:
+            # Ошибка самого запуска также должна разблокировать окно.
+            self._set_task_ui(False)
+            self.progress.setValue(0)
+            self._error(exc)
 
     def _request_cancel(self):
-        self._cancel.set()
+        if not self._busy:
+            return
+
+        self._tasks.request_cancel()
         self.stop_button.setEnabled(False)
-        self._log("Остановка после текущего батча…")
+        self._log("Запрошена остановка текущей операции…")
 
     def _poll(self):
-        """Разобрать очередь сообщений рабочего потока (вызывается таймером)."""
+        """Обработать сообщения рабочего потока в главном потоке Qt."""
         redraw = False
+
         while True:
-            try:
-                message = self._queue.get_nowait()
-            except Empty:
+            message = self._tasks.take_message()
+
+            if message is None:
                 break
-            if message[0] == "epoch":
-                self._on_epoch(message[1])
+
+            kind = message[0]
+
+            if kind == "epoch":
+                self._guard(
+                    lambda row=message[1]: self._on_epoch(row)
+                )
                 redraw = True
-            elif message[0] == "done":
+
+            elif kind == "done":
                 _, done, result, error = message
-                self._busy = False
-                for widget in (self.train_tabs, self.val_tabs, self.project_bar, self.mode_button, self.device_bar,):
-                    widget.setEnabled(True)
-                self.stop_button.setEnabled(False)
-                self.progress.setRange(0, 100)
-                self.progress.setValue(100)
+
+                self._set_task_ui(False)
+
                 if error is not None:
                     self._error(error)
                 else:
-                    self._guard(lambda: done(result))
+                    self._guard(
+                        lambda callback=done, value=result: callback(value)
+                    )
+
                 if self._close_after_task:
                     self._close_after_task = False
                     self.close()
+                    return
+
                 redraw = True
+
         if redraw or self._redraw_pending:
             self._redraw_pending = False
             self._redraw()
@@ -921,18 +938,41 @@ class MainWindow(QMainWindow):
     # ==================================================================
     # Проект
     # ==================================================================
-    def _confirm_discard(self) -> bool:
-        """Если есть несохранённые изменения — спросить: сохранить / не сохранять / отмена."""
+    def _confirm_discard(self, on_continue):
+        """Продолжить действие после проверки несохранённых изменений.
+
+        При выборе «Сохранить» продолжение вызывается только
+        после успешной фоновой записи проекта.
+        """
+        if self._busy:
+            return
+
         if not self.dirty or self.project_dir is None:
-            return True
+            self._guard(on_continue)
+            return
+
         answer = QMessageBox.question(
-            self, "Несохранённые изменения", "Текущая модель изменена и не сохранена. Сохранить проект?",
-            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel)
+            self,
+            "Несохранённые изменения",
+            "Текущая модель изменена и не сохранена. "
+            "Сохранить проект?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+
         if answer == QMessageBox.StandardButton.Cancel:
-            return False
+            return
+
         if answer == QMessageBox.StandardButton.Save:
-            return bool(self._guard(lambda: self._save_project_now() or True))
-        return True
+            self._save_project_async(
+                on_success=on_continue,
+            )
+            return
+
+        if answer == QMessageBox.StandardButton.Discard:
+            self._guard(on_continue)
 
     def _attach_logger(self, folder: Path):
         """Подключить logs.txt проекта и записать в него буфер ранних сообщений."""
@@ -962,10 +1002,15 @@ class MainWindow(QMainWindow):
         self.split_info.setText("Разделение не выполнено")
         self.weights_list.clear()
         self._refresh_atoms()
+        self.result_metadata = None
 
     def new_project(self):
+        """Запросить создание проекта с проверкой текущих изменений."""
+        self._confirm_discard(self._new_project_after_confirm)
+
+    def _new_project_after_confirm(self):
         """Создать проект: пользователь выбирает (или создаёт) пустую папку."""
-        if self._busy or not self._confirm_discard():
+        if self._busy:
             return
         folder = QFileDialog.getExistingDirectory(self, "Папка нового проекта (создайте пустую папку)")
         if not folder:
@@ -1008,15 +1053,179 @@ class MainWindow(QMainWindow):
         self._write_json(self.project_dir / "project.json", self.manifest)
         self._set_dirty(False)
 
-    def save_project(self):
-        """Кнопка «Сохранить проект»."""
+    def _save_project_async(self, *, force_weights=False, on_success=None):
+        """Сохранить проект в рабочем потоке.
+
+        force_weights=True:
+            всегда создать новый файл весов.
+
+        force_weights=False:
+            создать файл весов, если модель изменена
+            или ещё не имеет сохранённого файла.
+        """
         if self._busy:
             return
-        self._guard(lambda: (self._save_project_now(), self._log("Проект сохранён.")))
+
+        def prepare():
+            self._require_project()
+
+            service = self.service
+
+            if force_weights and not service.is_fitted:
+                raise ValueError(
+                    "Нет обученной модели для сохранения."
+                )
+
+            save_weights = (
+                service.is_fitted
+                and (
+                    force_weights
+                    or self.dirty
+                    or not self.current_weights
+                )
+            )
+
+            # Виджеты читаются только в главном потоке.
+            # Рабочий поток получит независимую копию манифеста.
+            manifest = copy.deepcopy(self._manifest_now())
+            project_dir = self.project_dir
+            store = ProjectStore(project_dir)
+
+            weights_path = None
+            weights_entry = None
+            metadata = None
+
+            if save_weights:
+                weights_path = store.unique_path(
+                    "weights",
+                    "weights",
+                    ".pt",
+                )
+
+                last_metrics = (
+                    copy.deepcopy(self.history[-1])
+                    if self.history
+                    else {}
+                )
+
+                metadata = {
+                    "created": datetime.now().astimezone().isoformat(
+                        timespec="seconds"
+                    ),
+                    "kind": "manual" if force_weights else "session",
+                    "epochs": service.trained_epochs,
+                    "metrics": last_metrics,
+                    "train_data_sha256": (
+                        self.manifest
+                        .get("datasets", {})
+                        .get("train", {})
+                        .get("sha256")
+                    ),
+                    "split_seed": (
+                        None
+                        if self.split is None
+                        else self.split.get("seed")
+                    ),
+                    "train_fingerprint": self.model_fingerprint,
+                }
+
+                weights_entry = store.jsonable({
+                    "file": store.relative_path(weights_path),
+                    **metadata,
+                    "config": copy.deepcopy(service.config),
+                })
+
+            return {
+                "service": service,
+                "store": store,
+                "project_dir": project_dir,
+                "manifest": manifest,
+                "weights_path": weights_path,
+                "weights_entry": weights_entry,
+                "metadata": metadata,
+            }
+
+        prepared = self._guard(prepare)
+
+        if prepared is None:
+            return
+
+        def work():
+            service = prepared["service"]
+            store = prepared["store"]
+            manifest = prepared["manifest"]
+            weights_path = prepared["weights_path"]
+            weights_entry = prepared["weights_entry"]
+
+            if weights_path is not None:
+                service.export_weights(
+                    weights_path,
+                    metadata=prepared["metadata"],
+                )
+
+                manifest.setdefault("weights", []).append(
+                    weights_entry
+                )
+                manifest["current_weights"] = weights_entry["file"]
+
+            # Сначала полностью записываем веса.
+            # Затем обновляем манифест, который ссылается на них.
+            store.write_json(
+                prepared["project_dir"] / "project.json",
+                manifest,
+            )
+
+            return manifest, weights_entry
+
+        def done(payload):
+            manifest, weights_entry = payload
+
+            self.manifest = manifest
+            self.current_weights = manifest.get("current_weights")
+
+            self._refresh_weights_list()
+            self._set_dirty(False)
+
+            if weights_entry is not None:
+                self._log(
+                    "Проект и веса сохранены: "
+                    f"{weights_entry['file']}"
+                )
+            else:
+                self._log("Проект сохранён.")
+
+            # Если во время сохранения пользователь закрыл окно,
+            # закрытие обработает _poll(). Не запускаем другое действие.
+            if (
+                    on_success is not None
+                    and not self._close_after_task
+            ):
+                on_success()
+
+        title = (
+            "Сохранение проекта и весов"
+            if prepared["weights_path"] is not None
+            else "Сохранение проекта"
+        )
+
+        self._run(
+            title,
+            work,
+            done,
+            cancellable=False,
+        )
+
+    def save_project(self):
+        """Сохранить проект и при необходимости текущие веса."""
+        self._save_project_async(force_weights=False)
 
     def open_project(self):
+        """Запросить открытие проекта с проверкой текущих изменений."""
+        self._confirm_discard(self._open_project_after_confirm)
+
+    def _open_project_after_confirm(self):
         """Открыть существующий проект (project.json) и восстановить сессию."""
-        if self._busy or not self._confirm_discard():
+        if self._busy:
             return
         selected, _ = QFileDialog.getOpenFileName(self, "Открыть проект", "", "Проект Q-Net Lab (project.json)")
         if not selected:
@@ -1033,12 +1242,18 @@ class MainWindow(QMainWindow):
             restored = {"folder": folder, "manifest": manifest, "service": NeuralService(device=device_name), "data": {}, "warnings": []}
             for role, entry in manifest.get("datasets", {}).items():
                 try:
-                    restored["data"][role] = self._read_dataset(folder, entry, restored["warnings"])
+                    restored["data"][role] = (
+                        ProjectStore(folder).read_dataset(
+                            entry,
+                            restored["warnings"],
+                            restored["service"].load_data,
+                        )
+                    )
                 except (ValueError, OSError) as exc:
                     restored["warnings"].append(f"Набор данных «{role}» не загружен: {exc}")
             weights = manifest.get("current_weights")
             if weights:
-                file = (folder / weights).resolve()
+                file = ProjectStore(folder).inside(weights)
                 if folder not in file.parents:
                     raise ValueError("Путь к весам выходит за пределы проекта.")
                 try:
@@ -1059,36 +1274,6 @@ class MainWindow(QMainWindow):
                     manifest["split"] = None
             return restored
         self._run("Открытие проекта", read, self._project_opened)
-
-    def _read_dataset(self, folder: Path, entry: dict, warnings: list) -> dict:
-        """Прочитать набор данных проекта и проверить SHA-256 исходного файла."""
-        if entry.get("copied"):
-            file = (folder / entry["file"]).resolve()
-            if folder not in file.parents:
-                raise ValueError("Путь к данным выходит за пределы проекта.")
-        else:
-            file = Path(entry["file"])
-        if not file.is_file():
-            raise ValueError(f"Файл данных проекта не найден: {file}")
-        entry["actual_sha256"] = self._sha256(file)
-        if entry["actual_sha256"] != entry.get("sha256"):
-            warnings.append(f"Файл {file.name} изменился после импорта (SHA-256 не совпадает). "
-                            "Разбиение сброшено; проверка на test для прежних весов будет помечена как неподтверждённая.")
-            entry["sha_mismatch"] = True
-        data = self.service.load_data(file)
-        if entry.get("labels_override"):
-            labels_file = (folder / entry["labels_override"]).resolve()
-            if not labels_file.is_file():
-                warnings.append(f"Файл исправленных меток {entry['labels_override']} не найден — "
-                                "используются исходные метки подготовки.")
-                entry["labels_override"] = None
-                return data
-            labels = np.load(labels_file, allow_pickle=False)
-            if data["labels"] is None or labels.shape != data["labels"].shape:
-                raise ValueError("Файл исправленных меток не соответствует данным.")
-            data["prepared_labels"] = data["labels"]   # подготовка сохраняется отдельно от псевдометок
-            data["labels"] = labels.astype(np.int64)
-        return data
 
     def _project_opened(self, restored: dict):
         self._reset_state()
@@ -1165,6 +1350,7 @@ class MainWindow(QMainWindow):
             self.make_split(quiet=True)
         else:
             self.eval_data, self.result, self.diagnostics = data, None, None
+            self.result_metadata = None
             self.eval_info.setText(self._describe_data(data, "eval"))
         self._refresh_atoms()
         self._write_json(self.project_dir / "project.json", self._manifest_now())
@@ -1512,11 +1698,23 @@ class MainWindow(QMainWindow):
         def work():
             try:
                 report = self.service.train(data, train_indices=split["train"], val_indices=split["validation"],
-                                            config=config, fine_tune=fine_tune, cancel_event=self._cancel,
-                                            callback=lambda row: self._queue.put(("epoch", row)), **parameters)
+                                            config=config, fine_tune=fine_tune, cancel_event=self._tasks.cancel_event,
+                                            callback=self._tasks.publish_epoch, **parameters)
                 evaluation = None
-                if self.service.is_fitted and len(split["validation"]):
-                    evaluation = self.service.validate(data, split["validation"], batch_size=parameters["batch_size"] * 4)
+
+                should_validate = (
+                    self.service.is_fitted
+                    and len(split["validation"]) > 0
+                    and not report["cancelled"]
+                    and not self._tasks.cancel_event.is_set()
+                )
+
+                if should_validate:
+                    evaluation = self.service.validate(
+                        data,
+                        split["validation"],
+                        batch_size=parameters["batch_size"] * 4,
+                    )
                 return report, evaluation, None
             except Exception as exc:  # noqa: BLE001 — модель могла измениться до ошибки
                 changed = (id(self.service.model) != model_id_before or self.service.update_steps != steps_before)
@@ -1557,6 +1755,7 @@ class MainWindow(QMainWindow):
         report, evaluation, failure = payload
         # Прежние результаты валидации/классификации относятся к другой модели.
         self.result, self.diagnostics = None, None
+        self.result_metadata = None
         self.val_summary.setText("Модель изменена: выполните валидацию или классификацию заново.")
         self.details.clear()
         if failure is not None:
@@ -1589,30 +1788,182 @@ class MainWindow(QMainWindow):
                                        + self._metrics_text(evaluation))
         self._write_json(self.project_dir / "project.json", self._manifest_now() | {"current_weights": None})
 
+    def _run_evaluation(
+        self,
+        title,
+        work,
+        *,
+        source,
+        dataset_role,
+        data,
+        indices=None,
+        f01=None,
+    ):
+        """Запустить расчёт с фиксацией происхождения результата."""
+        if self._busy:
+            return
+
+        def prepare():
+            dataset_entry = copy.deepcopy(
+                self.manifest
+                .get("datasets", {})
+                .get(dataset_role)
+            )
+
+            if dataset_entry is None:
+                raise ValueError(
+                    "В проекте отсутствует описание набора данных "
+                    f"{dataset_role!r}."
+                )
+
+            if indices is None:
+                selection = {
+                    "kind": "all",
+                    "count": len(data["iq"]),
+                }
+            else:
+                # Явный порядок байтов делает отпечаток независимым
+                # от архитектуры компьютера.
+                selected = np.ascontiguousarray(
+                    indices,
+                    dtype="<i8",
+                )
+
+                selection = {
+                    "kind": "indices",
+                    "count": len(selected),
+                    "sha256": hashlib.sha256(
+                        selected.tobytes()
+                    ).hexdigest(),
+                    "encoding": "int64-little-endian",
+                }
+
+            weights_saved = (
+                self.current_weights is not None
+                and not self.dirty
+            )
+
+            return {
+                "started": datetime.now().astimezone().isoformat(
+                    timespec="seconds"
+                ),
+                "source": source,
+                "application_version": APP_VERSION,
+                "project": (
+                    str(self.project_dir)
+                    if self.project_dir is not None
+                    else None
+                ),
+                "weights": (
+                    self.current_weights
+                    if weights_saved
+                    else None
+                ),
+                "weights_saved": weights_saved,
+                "model": copy.deepcopy(self.service.describe()),
+                "model_train_fingerprint": self.model_fingerprint,
+                "data": {
+                    dataset_role: dataset_entry,
+                },
+                "dataset_role": dataset_role,
+                "selection": selection,
+                "evaluation_parameters": {
+                    "f01_ghz": copy.deepcopy(f01),
+                },
+            }
+
+        metadata = self._guard(prepare)
+
+        if metadata is None:
+            return
+
+        def calculate():
+            result = work()
+
+            metadata["completed"] = (
+                datetime.now()
+                .astimezone()
+                .isoformat(timespec="seconds")
+            )
+
+            return result, metadata
+
+        def done(payload):
+            result, result_metadata = payload
+
+            self._validation_done(
+                result,
+                source=result_metadata["source"],
+                metadata=result_metadata,
+            )
+
+        self._run(title, calculate, done)
+
     def validate_test_split(self):
-        """Оценить модель на отложенной test-части обучающего набора."""
+        """Оценить модель на отложенной test-части."""
         if self._busy:
             return
 
         def check():
-            if self.train_data is None or self.split is None or not len(self.split["test"]):
-                raise ValueError("Нет отложенного test: загрузите данные и выполните разделение.")
+            if (
+                self.train_data is None
+                or self.split is None
+                or not len(self.split["test"])
+            ):
+                raise ValueError(
+                    "Нет отложенного test: загрузите данные "
+                    "и выполните разделение."
+                )
+
             if not self.service.is_fitted:
-                raise ValueError("Сначала обучите сеть или загрузите веса.")
-            return True
-        if self._guard(check):
-            if self.model_fingerprint != self._train_fingerprint():
-                answer = QMessageBox.question(
-                    self, "Независимость test не подтверждена",
-                    "Текущие веса обучены не на train текущего разбиения (разбиение или данные изменены, "
-                    "веса загружены из другого проекта или дообучены на другой выборке). Test может "
-                    "пересекаться с обучающими данными этих весов, и оценка будет завышена. Всё равно проверить?")
-                if answer != QMessageBox.StandardButton.Yes:
-                    return
-            f01 = self._guard(self._f01)
-            data, indices = self.train_data, self.split["test"]
-            self._run("Проверка на test", lambda: self.service.validate(data, indices, f01_ghz=f01),
-                      lambda r: self._validation_done(r, data, "отложенный test"))
+                raise ValueError(
+                    "Сначала обучите сеть или загрузите веса."
+                )
+
+            self._check_split()
+
+            return {
+                "f01": self._f01(),
+                "fingerprint": self._train_fingerprint(),
+            }
+
+        checked = self._guard(check)
+
+        if checked is None:
+            return
+
+        if self.model_fingerprint != checked["fingerprint"]:
+            answer = QMessageBox.question(
+                self,
+                "Независимость test не подтверждена",
+                "Текущие веса обучены не на train текущего "
+                "разбиения либо происхождение весов неизвестно. "
+                "Test может пересекаться с обучающими данными "
+                "этих весов, и оценка будет завышена. "
+                "Всё равно проверить?",
+            )
+
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        service = self.service
+        data = self.train_data
+        indices = self.split["test"].copy()
+        f01 = checked["f01"]
+
+        self._run_evaluation(
+            "Проверка на test",
+            lambda: service.validate(
+                data,
+                indices,
+                f01_ghz=f01,
+            ),
+            source="отложенный test",
+            dataset_role="train",
+            data=data,
+            indices=indices,
+            f01=f01,
+        )
 
     # ------------------------------------------------------------------
     # Веса
@@ -1638,9 +1989,8 @@ class MainWindow(QMainWindow):
         return entry["file"]
 
     def save_weights(self):
-        """Кнопка «Сохранить веса»: новый файл весов в weights/ с датой в имени."""
-        if self._busy:
-            return
+        """Сохранить новый набор весов и обновить проект."""
+        self._save_project_async(force_weights=True)
 
         def save():
             self._export_weights_now()
@@ -1681,8 +2031,48 @@ class MainWindow(QMainWindow):
             self._load_weights(path, copy_into_project=self.project_dir not in path.parents)
 
     def _load_weights(self, path: Path, copy_into_project: bool):
-        if self._busy or not self._confirm_discard():
+        """Проверить изменения перед заменой текущей модели."""
+        self._confirm_discard(
+            lambda: self._load_weights_after_confirm(
+                path,
+                copy_into_project,
+            )
+        )
+
+    def _load_weights_after_confirm(
+            self,
+            path: Path,
+            copy_into_project: bool,
+    ):
+        """Загрузить веса после подтверждения пользователя."""
+        if self._busy:
             return
+
+        def work():
+            target = path
+
+            if copy_into_project:
+                target = self._unique(
+                    "weights",
+                    "imported",
+                    ".pt",
+                )
+                shutil.copy2(path, target)
+
+            try:
+                info = self.service.load_weights(target)
+            except Exception:
+                if copy_into_project:
+                    target.unlink(missing_ok=True)
+                raise
+
+            return target, info
+
+        self._run(
+            "Загрузка весов",
+            work,
+            self._weights_loaded,
+        )
 
         def work():
             target = path
@@ -1710,6 +2100,7 @@ class MainWindow(QMainWindow):
         self.model_fingerprint = (info.get("metadata") or {}).get("train_fingerprint")
         self.history = self._clean_history([])
         self.result = self.train_eval = self.diagnostics = None
+        self.result_metadata = None
         self._form_from_config(info["config"])
         self._refresh_weights_list()
         self._refresh_atoms()
@@ -1720,62 +2111,62 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Журналы обучения
     # ------------------------------------------------------------------
-    def _clean_history(self, rows) -> list[dict]:
-        """Проверить строки журнала: epoch — целое > 0, метрики — числа или пусто."""
-        if not isinstance(rows, list):
-            raise ValueError("Журнал должен быть списком записей эпох.")
-        clean = []
-        for row in rows:
-            if not isinstance(row, dict) or "epoch" not in row:
-                raise ValueError("В каждой записи журнала нужен столбец epoch.")
-            item = {}
-            for key in self.HISTORY_KEYS:
-                value = row.get(key)
-                if value in (None, "", "None", "null", "nan"):
-                    item[key] = None
-                    continue
-                number = float(value)
-                if not math.isfinite(number):
-                    item[key] = None
-                    continue
-                item[key] = number
-            if item["epoch"] is None or item["epoch"] != int(item["epoch"]) or item["epoch"] < 1:
-                raise ValueError(f"Некорректный номер эпохи: {row.get('epoch')}")
-            item["epoch"] = int(item["epoch"])
-            clean.append(item)
-        return clean
+    @staticmethod
+    def _clean_history(rows) -> list[dict]:
+        return clean_history(rows)
 
     def load_history_dialog(self):
-        """Кнопка «Загрузить журнал»: CSV (как logs/training_*.csv) или JSON (список или project.json)."""
+        """Выбрать журнал и загрузить его в рабочем потоке."""
         if self._busy:
             return
 
-        def load():
-            self._require_project()
-            selected, _ = QFileDialog.getOpenFileName(self, "Журнал обучения", str(self.project_dir / "logs"),
-                                                      "Журнал (*.csv *.json)")
-            if not selected:
-                return
-            path = Path(selected)
-            if path.suffix.lower() == ".json":
-                rows = json.loads(path.read_text(encoding="utf-8"))
-                rows = rows.get("history", []) if isinstance(rows, dict) else rows
-            else:
-                with path.open(encoding="utf-8-sig", newline="") as stream:
-                    head = stream.read(4096)
-                    stream.seek(0)
-                    try:
-                        dialect = csv.Sniffer().sniff(head.splitlines()[0], delimiters=",;\t")
-                    except (csv.Error, IndexError):
-                        dialect = csv.excel
-                    rows = list(csv.DictReader(stream, dialect=dialect))
-            self.history = self._clean_history(rows)
-            if self.project_dir not in path.resolve().parents:
-                shutil.copy2(path, self._unique("logs", "imported", path.suffix.lower()))
+        if not self._guard(lambda: self._require_project() or True):
+            return
+
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Журнал обучения",
+            str(self.project_dir / "logs"),
+            "Журнал (*.csv *.json)",
+        )
+
+        if not selected:
+            return
+
+        path = Path(selected).resolve()
+        project_dir = self.project_dir
+        store = ProjectStore(project_dir)
+
+        def work():
+            # Сначала проверяем файл. Некорректный журнал
+            # не заменяет текущую историю и не копируется в проект.
+            history = read_history(path)
+
+            if project_dir not in path.parents:
+                target = store.unique_path(
+                    "logs",
+                    "imported",
+                    path.suffix.lower(),
+                )
+                shutil.copy2(path, target)
+
+            return history
+
+        def done(history):
+            self.history = history
             self.mode_button.setChecked(False)
             self._schedule_redraw()
-            self._log(f"Загружен журнал {path.name}: {len(self.history)} эпох.")
-        self._guard(load)
+
+            self._log(
+                f"Загружен журнал {path.name}: "
+                f"{len(history)} эпох."
+            )
+
+        self._run(
+            "Загрузка журнала обучения",
+            work,
+            done,
+        )
 
     # ------------------------------------------------------------------
     # Валидация, классификация, фильтры
@@ -1799,34 +2190,78 @@ class MainWindow(QMainWindow):
             raise ValueError("В данных нет меток. Для данных без меток используйте «Классифицировать».")
 
     def validate_external(self):
-        """Валидация на экспериментальных данных с метками (бенчмарки, матрицы, физика)."""
+        """Валидация на внешних данных с метками."""
         if self._busy:
             return
+
         def check():
             self._need_eval(labels=True)
             return {"f01": self._f01()}
+
         checked = self._guard(check)
+
         if checked is None:
             return
-        f01, data = checked["f01"], self.eval_data
-        self._run("Валидация", lambda: self.service.validate(data, f01_ghz=f01),
-                  lambda r: self._validation_done(r, data, "экспериментальные данные"))
+
+        service = self.service
+        data = self.eval_data
+        f01 = checked["f01"]
+
+        self._run_evaluation(
+            "Валидация",
+            lambda: service.validate(
+                data,
+                f01_ghz=f01,
+            ),
+            source="экспериментальные данные",
+            dataset_role="eval",
+            data=data,
+            f01=f01,
+        )
 
     def classify_external(self):
-        """Классификация данных (метки не нужны): предсказания, вероятности, пятна."""
-        if self._busy or self._guard(lambda: self._need_eval() or True) is None:
+        """Классификация экспериментальных данных."""
+        if self._busy:
             return
-        data = self.eval_data
-        self._run("Классификация", lambda: self.service.infer(data),
-                  lambda r: self._validation_done(r, data, "классификация без меток"))
 
-    def _validation_done(self, result: dict, data: dict, source: str):
-        self.result, self.result_source = result, source
+        if self._guard(lambda: self._need_eval() or True) is None:
+            return
+
+        service = self.service
+        data = self.eval_data
+
+        self._run_evaluation(
+            "Классификация",
+            lambda: service.infer(data),
+            source="классификация без меток",
+            dataset_role="eval",
+            data=data,
+        )
+
+    def _validation_done(
+        self,
+        result: dict,
+        *,
+        source: str,
+        metadata: dict,
+    ):
+        self.result = result
+        self.result_source = source
+        self.result_metadata = copy.deepcopy(metadata)
+
         self.mode_button.setChecked(True)
         self._refresh_atoms()
-        self.val_summary.setText(f"{source}: " + self._metrics_text(result))
-        self.details.setPlainText(self._details_text(result))
-        self._log(f"Готово ({source}): {self._metrics_text(result)}")
+
+        self.val_summary.setText(
+            f"{source}: " + self._metrics_text(result)
+        )
+        self.details.setPlainText(
+            self._details_text(result)
+        )
+
+        self._log(
+            f"Готово ({source}): {self._metrics_text(result)}"
+        )
 
     def apply_filters(self):
         """Применить фильтры модели к экспериментальным данным и показать гистограммы."""
@@ -1893,53 +2328,127 @@ class MainWindow(QMainWindow):
     # Экспорт
     # ------------------------------------------------------------------
     def export_predictions(self):
-        """Предсказания и вероятности в reports/predictions_….csv (с исходными shot_ids)."""
-        def export():
+        """Экспортировать результаты распознавания в рабочем потоке."""
+        if self._busy:
+            return
+
+        def prepare():
             self._require_project()
+
             if self.result is None:
-                raise ValueError("Сначала выполните валидацию или классификацию.")
-            r = self.result
-            path = self._unique("reports", "predictions", ".csv")
-            atoms = r["atoms"]
-            header = ["shot_id", "register_state"]
-            for a, channel in enumerate(atoms):
-                if "labels" in r:
-                    header.append(f"label_{channel}")
-                header += [f"prediction_{channel}"] + [f"p_{channel}_{s}" for s in range(r["probabilities"][a].shape[1])]
-            register = self.service.register_state(r["predictions"])
-            with path.open("w", encoding="utf-8-sig", newline="") as stream:
-                writer = csv.writer(stream)
-                writer.writerow(header)
-                for i in range(len(r["predictions"])):
-                    row = [int(r["shot_ids"][i]), int(register[i])]
-                    for a in range(len(atoms)):
-                        if "labels" in r:
-                            row.append(int(r["labels"][i, a]))
-                        row.append(int(r["predictions"][i, a]))
-                        row += [f"{v:.6g}" for v in r["probabilities"][a][i]]
-                    writer.writerow(row)
-            self._log(f"Результаты распознавания сохранены: {self._relative(path)}")
-        self._guard(export)
+                raise ValueError(
+                    "Сначала выполните валидацию или классификацию."
+                )
+
+            return {
+                "result": self.result,
+                "service": self.service,
+                "path": self._unique(
+                    "reports",
+                    "predictions",
+                    ".csv",
+                ),
+            }
+
+        prepared = self._guard(prepare)
+
+        if prepared is None:
+            return
+
+        def work():
+            result = prepared["result"]
+
+            # Вычисление состояния регистра остаётся
+            # ответственностью NeuralService.
+            register_states = prepared["service"].register_state(
+                result["predictions"]
+            )
+
+            write_predictions_csv(
+                prepared["path"],
+                result=result,
+                register_states=register_states,
+            )
+
+            return prepared["path"]
+
+        def done(path):
+            self._log(
+                "Результаты распознавания сохранены: "
+                f"{self._relative(path)}"
+            )
+
+        self._run(
+            "Экспорт результатов распознавания",
+            work,
+            done,
+            cancellable=False,
+        )
 
     def export_report(self):
-        """Отчёт с метриками, конфигурацией и происхождением данных в reports/report_….json."""
-        def export():
+        """Экспортировать результат вместе с его исходными метаданными."""
+        if self._busy:
+            return
+
+        def prepare():
             self._require_project()
+
             if self.result is None:
-                raise ValueError("Сначала выполните валидацию или классификацию.")
-            r = self.result
-            report = dict(created=datetime.now().astimezone().isoformat(timespec="seconds"), source=self.result_source,
-                          weights=self.current_weights, model=self.service.describe(),
-                          data=self.manifest.get("datasets"),
-                          metrics={k: r.get(k) for k in ("accuracy", "assignment_fidelity", "macro_f1", "loss",
-                                                          "xeb_labels", "xeb_linear", "benchmarks", "excluded")},
-                          per_atom=r.get("per_atom"), warnings=r.get("warnings"),
-                          notes="score = доля измерений со всеми атомами верно; F_nQ — геометрическое среднее "
-                                "assignment fidelity атомов; физические оценки включают SPAM.")
-            path = self._unique("reports", "report", ".json")
-            self._write_json(path, report)
-            self._log(f"Отчёт сохранён: {self._relative(path)}")
-        self._guard(export)
+                raise ValueError(
+                    "Сначала выполните валидацию или классификацию."
+                )
+
+            if self.result_metadata is None:
+                raise ValueError(
+                    "Для результата отсутствуют сведения "
+                    "о происхождении. Повторите расчёт."
+                )
+
+            metadata = copy.deepcopy(self.result_metadata)
+
+            # created — время создания отчёта.
+            # started/completed — время самого расчёта.
+            metadata["created"] = (
+                datetime.now()
+                .astimezone()
+                .isoformat(timespec="seconds")
+            )
+
+            return {
+                "result": self.result,
+                "metadata": metadata,
+                "path": self._unique(
+                    "reports",
+                    "report",
+                    ".json",
+                ),
+            }
+
+        prepared = self._guard(prepare)
+
+        if prepared is None:
+            return
+
+        def work():
+            write_report_json(
+                prepared["path"],
+                result=prepared["result"],
+                metadata=prepared["metadata"],
+            )
+
+            return prepared["path"]
+
+        def done(path):
+            self._log(
+                f"Отчёт сохранён: {self._relative(path)}"
+            )
+
+        self._run(
+            "Экспорт отчёта",
+            work,
+            done,
+            cancellable=False,
+        )
 
     def export_figure(self):
         """Текущий график (активного режима) в reports/figure_….png."""
@@ -2009,124 +2518,50 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _grid(count: int):
-        columns = 1 if count == 1 else 2 if count <= 4 else 3
-        return math.ceil(count / columns), columns
+        return plotting.grid_shape(count)
 
     @staticmethod
     def _message(figure, canvas, text):
-        figure.clear()
-        ax = figure.add_subplot(111)
-        ax.text(0.5, 0.5, text, ha="center", va="center", wrap=True, color="#5b6b82", fontsize=12)
-        ax.set_axis_off()
+        plotting.draw_message(figure, text)
         canvas.draw_idle()
 
     def _draw_training(self):
-        fig = self.train_figure
-        keys = [k for k, c in self.chart_checks.items() if c.isChecked()]
-        if not keys:
-            self._message(fig, self.train_canvas, "Отметьте хотя бы один график сверху.")
-            return
-        if not self.history and self.train_eval is None:
-            self._message(fig, self.train_canvas, "Графики появятся после первой эпохи обучения\n"
-                                                  "или после загрузки журнала обучения.")
-            return
-        fig.clear()
-        rows, cols = self._grid(len(keys))
-        epochs = [r["epoch"] for r in self.history]
-        for position, key in enumerate(keys, 1):
-            ax = fig.add_subplot(rows, cols, position)
-            title, train_key, val_key = self.TRAIN_CHARTS[key]
-            ax.set_title(title, fontsize=10)
-            if key == "confusion":
-                self._draw_confusions(ax, self.train_eval)
-                continue
-            if key == "xeb":
-                # Linear XEB — только при идеальных распределениях (ideal_probs) в данных;
-                # иначе показывается XEB по меткам подготовки = accuracy с поправкой
-                # на случайное угадывание (D·acc − 1)/(D − 1), с явной подписью.
-                if any(r.get("val_xeb_linear") is not None for r in self.history):
-                    val_key = "val_xeb_linear"
-                    ax.set_title("Linear XEB (по ideal_probs)", fontsize=10)
-                else:
-                    ax.set_title("XEB по меткам: (D·acc−1)/(D−1)\n(accuracy с поправкой на угадывание)", fontsize=9)
-            drawn = False
-            for field, label, color in ((train_key, "train", "#2563b8"), (val_key, "validation", "#e08a1e")):
-                if field is None:
-                    continue
-                values = [np.nan if r.get(field) is None else r[field] for r in self.history]
-                if not np.all(np.isnan(values)):
-                    ax.plot(epochs, values, label=label, color=color, lw=1.6, marker="o" if len(epochs) < 30 else None, ms=3)
-                    drawn = True
-            if drawn:
-                ax.set_xlabel("эпоха")
-                ax.grid(alpha=0.2)
-                ax.legend(fontsize=8, frameon=False)
-            else:
-                ax.text(0.5, 0.5, "нет данных (нужна validation)", ha="center", va="center", transform=ax.transAxes)
-        fig.tight_layout()
+        chart_keys = [
+            key
+            for key, checkbox in self.chart_checks.items()
+            if checkbox.isChecked()
+        ]
+
+        plotting.draw_training(
+            self.train_figure,
+            history=self.history,
+            evaluation=self.train_eval,
+            chart_keys=chart_keys,
+            chart_specs=self.TRAIN_CHARTS,
+            selected_atoms=self._selected_atoms(),
+        )
+
         self.train_canvas.draw_idle()
 
     def _draw_confusions(self, ax, result):
-        """Матрица ошибок первого выбранного атома (в режиме обучения — на validation)."""
-        if not result or not result.get("per_atom"):
-            ax.text(0.5, 0.5, "матрица появится после обучения", ha="center", va="center", transform=ax.transAxes)
-            ax.set_axis_off()
-            return
-        selected = self._selected_atoms()
-        entries = [p for p in result["per_atom"] if p["atom"] in selected] or result["per_atom"]
-        self._heatmap(ax, entries[0])
-
-    #: Постоянные цвета уровней |0⟩, |1⟩, |2⟩ … на всех графиках режима валидации.
-    LEVEL_COLORS = ["#2563b8", "#e08a1e", "#c43c3c", "#2e9e5b", "#7a3e9d", "#7f7f7f"]
+        plotting.draw_confusions(
+            ax,
+            result,
+            self._selected_atoms(),
+        )
 
     @staticmethod
     def _finish(fig, canvas):
-        """Одна общая легенда над графиками вместо легенды в каждом маленьком графике.
-
-        При пяти атомах легенды внутри осей закрывали данные. Подписи
-        собираются со всех осей (без повторов), легенда ставится над сеткой.
-        """
-        handles, labels = [], []
-        for ax in fig.axes:
-            for handle, label in zip(*ax.get_legend_handles_labels()):
-                if label not in labels and not label.startswith("_"):
-                    handles.append(handle)
-                    labels.append(label)
-            if ax.get_legend() is not None:
-                ax.get_legend().remove()
-        top = 1.0
-        if handles:
-            ncol = min(len(labels), 8)
-            rows = math.ceil(len(labels) / ncol)
-            fig.legend(handles, labels, loc="upper center", ncol=ncol, fontsize=8, frameon=False, markerscale=2)
-            top = 1.0 - 0.06 * rows
-        fig.tight_layout(rect=(0, 0, 1, top))
+        plotting.finish_figure(fig)
         canvas.draw_idle()
 
     @staticmethod
     def _heatmap(ax, entry, compact=False):
-        try:  # Seaborn (ТЗ, п. 4.2) используется для матриц ошибок; без него — matplotlib.
-            import seaborn as sns
-        except ImportError:  # pragma: no cover
-            sns = None
-
-        cm = np.asarray(entry["confusion"], float)
-        norm = cm / np.maximum(cm.sum(1, keepdims=True), 1)
-        # В компактном виде (много атомов) — только доли, иначе доля и число трасс.
-        cell = "{:.2f}" if compact else "{:.2f}\n({})"
-        annot = np.array([[cell.format(norm[i, j], int(cm[i, j])) for j in range(len(cm))] for i in range(len(cm))])
-        size = 7 if compact else 8
-        if sns is not None:
-            sns.heatmap(norm, ax=ax, annot=annot, fmt="", cmap="Blues", vmin=0, vmax=1, cbar=False,
-                        annot_kws={"fontsize": size})
-        else:
-            ax.imshow(norm, cmap="Blues", vmin=0, vmax=1)
-            for i in range(len(cm)):
-                for j in range(len(cm)):
-                    ax.text(j + 0.0, i, annot[i, j], ha="center", va="center", fontsize=size)
-        ax.set_xlabel("предсказание", fontsize=8 if compact else 10)
-        ax.set_ylabel("подготовлено", fontsize=8 if compact else 10)
-        ax.set_title(f"Атом {entry['atom']}" + ("" if compact else ": матрица ошибок"), fontsize=10)
+        plotting.draw_heatmap(
+            ax,
+            entry,
+            compact=compact,
+        )
 
     def _draw_validation(self):
         fig, canvas = self.val_figure, self.val_canvas
@@ -2143,7 +2578,7 @@ class MainWindow(QMainWindow):
             return self._draw_traces(atoms)
         if self.result is None:
             if view == "Пятна IQ" and self.leakage is not None:
-                return self._draw_leakage(self.leakage, self.leak_atom.value())
+                return self._draw_leakage(self.leakage, self.leakage["atom"])
             self._message(fig, canvas, "Нажмите «Валидировать» или «Классифицировать» на вкладке «Распознавание».")
             return
         r = self.result
@@ -2170,161 +2605,111 @@ class MainWindow(QMainWindow):
                 self._draw_physics(ax, r["per_atom"][a])
         self._finish(fig, canvas)
 
-    def _draw_spots(self, ax, r, a, channel):
-        """«Пятна»: MTV трасс на плоскости IQ, цвет — предсказание или метка; ошибки — крестиком."""
-        n = len(r["predictions"])
-        show = np.arange(n) if n <= 5000 else np.sort(np.random.default_rng(0).choice(n, 5000, replace=False))
-        by_label = self.color_combo.currentData() == "label" and "labels" in r
-        colors = (r["labels"] if by_label else r["predictions"])[show, a]
-        for s in np.unique(colors):
-            sel = show[colors == s]
-            ax.scatter(r["spots"][sel, a, 0], r["spots"][sel, a, 1], s=6, alpha=0.45,
-                       color=self.LEVEL_COLORS[int(s) % 6], label=f"|{s}⟩", rasterized=True)
-        if "labels" in r:
-            wrong = show[r["labels"][show, a] != r["predictions"][show, a]]
-            ax.scatter(r["spots"][wrong, a, 0], r["spots"][wrong, a, 1], s=14, marker="x", color="black",
-                       lw=0.7, label="ошибка")
-        ax.set(xlabel="I (MTV)", ylabel="Q (MTV)")
-        ax.set_title(f"Атом {channel}: пятна IQ", fontsize=10)
-        ax.grid(alpha=0.15)
+    def _draw_spots(self, ax, result, atom_index, channel):
+        plotting.draw_spots(
+            ax,
+            result,
+            atom_index,
+            channel,
+            color_by=self.color_combo.currentData(),
+        )
 
-    def _draw_benchmarks(self, ax, p):
-        names = ["NN", "центроид", "LDA", "QDA"]
-        values = [p["accuracy"]] + [p["benchmarks"].get(k) for k in ("centroid", "lda", "qda")]
-        bars = ax.bar(names, values, color=["#1f5bb4", "#9aa9bd", "#7fa3c9", "#5f87b8"])
-        for bar, v in zip(bars, values):
-            ax.text(bar.get_x() + bar.get_width() / 2, v + 0.01, f"{100 * v:.1f}%", ha="center", fontsize=8)
-        low = max(0.0, min(values) - 0.1)
-        ax.set_ylim(low, 1.02)
-        snr = ", ".join(f"{s['pair'][0]}|{s['pair'][1]} {s['snr']:.1f}" for s in p["separation"] if s["snr"] is not None)
-        ax.set_title(f"Атом {p['atom']}: точность\nSNR пятен: {snr}", fontsize=8)
-        ax.grid(alpha=0.2, axis="y")
+    def _draw_benchmarks(self, ax, entry):
+        plotting.draw_benchmarks(ax, entry)
 
-    def _draw_physics(self, ax, p):
-        """Ошибки распада/возбуждения по уровням и термальная населённость."""
-        k = len(p["decay_error"])
-        x = np.arange(k)
-        width = 0.2
-        series = (("распад (матрица)", p["decay_error"], "#c43c3c"),
-                  ("распад в окне", p["transition_down"], "#ef8a8a"),
-                  ("возбуждение (матрица)", p["excitation_error"], "#1f5bb4"),
-                  ("возбуждение в окне", p["transition_up"], "#8fb3e8"))
-        for i, (label, values, color) in enumerate(series):
-            ax.bar(x + (i - 1.5) * width, [0 if v is None else v for v in values], width, label=label, color=color)
-        ax.set_xticks(x, [f"|{i}⟩" for i in range(k)])
-        ax.set_xlabel("подготовленный уровень")
-        ax.set_ylabel("вероятность")
-        ax.set_title(f"Атом {p['atom']}", fontsize=10)
-        # Короткая подпись внутри осей; полные формулировки и оговорки — в тексте под графиком.
-        note = f"|0⟩ рано выше: {self._pct(p['thermal_population'])}"
-        if p.get("effective_temperature_mK") is not None:
-            note += f"\nT_eff ≈ {p['effective_temperature_mK']:.0f} мК*"
-        ax.text(0.02, 0.97, note, transform=ax.transAxes, va="top", fontsize=7,
-                bbox=dict(boxstyle="round", fc="white", ec="#c3cfdf", alpha=0.9))
-        ax.grid(alpha=0.2, axis="y")
+    def _draw_physics(self, ax, entry):
+        plotting.draw_physics(ax, entry)
 
     def _draw_kernels(self, atoms):
-        fig, canvas = self.val_figure, self.val_canvas
-        if not self.service.is_fitted or self.service.config["mode"] != "matched":
-            self._message(fig, canvas, "Ядра есть только у модели «фильтры + FNN» после обучения или загрузки весов.")
+        """Подготовить данные модели для отображения ядер."""
+        service = self.service
+
+        if (
+                not service.is_fitted
+                or service.config["mode"] != "matched"
+        ):
+            self._message(
+                self.val_figure,
+                self.val_canvas,
+                "Ядра есть только у модели «фильтры + FNN» "
+                "после обучения или загрузки весов.",
+            )
             return
-        used = self.service.config["atoms"]
-        atoms = [a for a in atoms if a in used]
-        fig.clear()
-        rows, cols = self._grid(max(len(atoms), 1))
-        f = self.service.filters
-        # Один и тот же фильтр — один цвет на всех атомах (иначе общая легенда врала бы).
-        names = [self.filter_combo.itemText(i) for i in range(self.filter_combo.count())]
-        cmap = matplotlib.colormaps["tab10"]
-        for position, channel in enumerate(atoms, 1):
-            ax = fig.add_subplot(rows, cols, position)
-            a = used.index(channel)
-            for kernel, d in zip(f["kernels"], f["descriptions"]):
-                if d["atom"] == a and d["available"]:
-                    name = NeuralService._kernel_name(d)
-                    color = cmap(names.index(name) % 10) if name in names else None
-                    ax.plot(np.real(kernel), lw=1.1, label=name, color=color)
-            ax.set_title(f"Атом {channel}: ядра (Re = вес I)", fontsize=10)
-            ax.set_xlabel("отсчёт окна")
-            ax.grid(alpha=0.2)
-        self._finish(fig, canvas)
+
+        used = service.config["atoms"]
+        selected_atoms = [
+            atom for atom in atoms if atom in used
+        ]
+
+        filters = service.filters
+        kernels = []
+
+        for kernel, description in zip(
+                filters["kernels"],
+                filters["descriptions"],
+        ):
+            if not description["available"]:
+                continue
+
+            # description["atom"] — индекс внутри списка
+            # выбранных моделью каналов, а не номер канала данных.
+            channel = used[description["atom"]]
+
+            if channel not in selected_atoms:
+                continue
+
+            kernels.append({
+                "channel": channel,
+                "name": NeuralService._kernel_name(description),
+                "values": kernel,
+            })
+
+        filter_names = [
+            self.filter_combo.itemText(index)
+            for index in range(self.filter_combo.count())
+        ]
+
+        plotting.draw_kernels(
+            self.val_figure,
+            atoms=selected_atoms,
+            kernels=kernels,
+            filter_names=filter_names,
+        )
+        self.val_canvas.draw_idle()
 
     def _draw_histograms(self, atoms):
-        fig, canvas = self.val_figure, self.val_canvas
-        if self.diagnostics is None:
-            self._message(fig, canvas, "Нажмите «Применить фильтры к данным» на вкладке «Фильтры».")
-            return
-        name = self.filter_combo.currentText()
-        atoms = [a for a in atoms if a in self.diagnostics]
-        if not atoms or self.diagnostics[atoms[0]]["values"] is None:
-            self._message(fig, canvas, "У модели «FNN по I/Q» нет банка фильтров — гистограммы недоступны.")
-            return
-        fig.clear()
-        rows, cols = self._grid(len(atoms))
-        for position, channel in enumerate(atoms, 1):
-            ax = fig.add_subplot(rows, cols, position)
-            entry = self.diagnostics[channel]
-            names = [n.replace(" (н/д)", "") for n in entry["names"]]
-            j = names.index(name) if name in names else 0
-            values = entry["values"][:, j]
-            labels = entry["labels"]
-            if labels is None:
-                ax.hist(values, bins=60, color="#1f5bb4", alpha=0.8)
-            else:
-                for s in np.unique(labels):
-                    ax.hist(values[labels == s], bins=60, alpha=0.55, label=f"|{s}⟩",
-                            color=self.LEVEL_COLORS[int(s) % 6])
-            ax.set_title(f"Атом {channel}: выход {entry['names'][j]}", fontsize=10)
-            ax.set_xlabel("значение фильтра")
-            ax.grid(alpha=0.2)
-        self._finish(fig, canvas)
+        plotting.draw_histograms(
+            self.val_figure,
+            atoms=atoms,
+            diagnostics=self.diagnostics,
+            filter_name=self.filter_combo.currentText(),
+        )
+        self.val_canvas.draw_idle()
 
     def _draw_traces(self, atoms):
-        """Кривые I и Q: средние трассы по меткам и несколько отдельных трасс."""
-        fig, canvas = self.val_figure, self.val_canvas
-        data = self.eval_data or self.train_data
-        if data is None:
-            self._message(fig, canvas, "Загрузите данные.")
-            return
-        atoms = [a for a in atoms if a < data["iq"].shape[1]]
-        fig.clear()
-        rows, cols = self._grid(max(len(atoms), 1))
-        t = data["time_ns"] if data.get("time_ns") is not None else np.arange(data["iq"].shape[2])
-        for position, channel in enumerate(atoms, 1):
-            ax = fig.add_subplot(rows, cols, position)
-            x = data["iq"][:, channel]   # представление (view), без копирования
-            if data["labels"] is not None:
-                for s in np.unique(data["labels"][:, channel]):
-                    # Подвыборка ≤ 2000 трасс на уровень: не копировать весь набор при перерисовке.
-                    sample = np.flatnonzero(data["labels"][:, channel] == s)[:2000]
-                    mean = x[sample].mean(0)
-                    color = self.LEVEL_COLORS[int(s) % 6]
-                    ax.plot(t, mean.real, lw=1.6, color=color, label=f"I, |{s}⟩")
-                    ax.plot(t, mean.imag, lw=1.2, ls="--", color=color, label=f"Q, |{s}⟩")
-            else:
-                for i in range(min(8, len(x))):
-                    ax.plot(t, x[i].real, color="#2563b8", alpha=0.3, lw=0.7)
-                    ax.plot(t, x[i].imag, color="#e08a1e", alpha=0.3, lw=0.7)
-            ax.set_title(f"Атом {channel}: средние трассы I (—) и Q (--)", fontsize=10)
-            ax.set_xlabel("время, нс" if data.get("time_ns") is not None else "отсчёт")
-            ax.grid(alpha=0.2)
-        self._finish(fig, canvas)
+        data = (
+            self.eval_data
+            if self.eval_data is not None
+            else self.train_data
+        )
+
+        plotting.draw_traces(
+            self.val_figure,
+            atoms=atoms,
+            data=data,
+        )
+        self.val_canvas.draw_idle()
 
     def _draw_leakage(self, result, atom):
-        """Показать предложение поиска утечки: MTV, цвет — предложенный уровень."""
-        fig, canvas = self.val_figure, self.val_canvas
+        # Переключение режима — обязанность окна, не plotting.
         self.mode_button.setChecked(True)
-        fig.clear()
-        ax = fig.add_subplot(111)
-        mtv, labels = result["mtv"], result["labels"]
-        for s in np.unique(labels):
-            sel = labels == s
-            ax.scatter(mtv[sel].real, mtv[sel].imag, s=6, alpha=0.5, label=f"предложено |{s}⟩ ({sel.sum()})")
-        ax.set(xlabel="I (MTV)", ylabel="Q (MTV)", title=f"Атом {atom}: спектральная кластеризация MTV (§V-A)")
-        ax.legend(fontsize=8)
-        ax.grid(alpha=0.2)
-        fig.tight_layout()
-        canvas.draw_idle()
+
+        plotting.draw_leakage(
+            self.val_figure,
+            result=result,
+            atom=atom,
+        )
+        self.val_canvas.draw_idle()
 
     # ==================================================================
     # Справка и закрытие
@@ -2340,22 +2725,39 @@ class MainWindow(QMainWindow):
             "7. Экспорт результатов, отчётов и графиков — в папку reports/ проекта.\n\n"
             "Форматы данных описаны в README.txt и UserGuide.html."))
 
+    def _approve_close(self):
+        """Закрыть окно после подтверждения или успешного сохранения."""
+        self._close_confirmed = True
+        self.close()
+
     def closeEvent(self, event: QCloseEvent):
-        """Закрытие: дождаться текущего батча и предложить сохранить несохранённую модель."""
+        """Закрыть окно после завершения задачи и сохранения изменений."""
         if self._busy:
             self._close_after_task = True
-            self._cancel.set()
-            self._log("Завершение текущей операции перед закрытием…")
+            self._tasks.request_cancel()
+            self.stop_button.setEnabled(False)
+
+            self._log(
+                "Завершение текущей операции перед закрытием…"
+            )
             event.ignore()
             return
-        if not self._confirm_discard():
+
+        if not self._close_confirmed and self.dirty:
+            # Сначала отклоняем текущее закрытие.
+            # После подтверждения _approve_close() вызовет close() снова.
             event.ignore()
+            self._confirm_discard(self._approve_close)
             return
+
         self._timer.stop()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._tasks.shutdown()
+
         if self._logger is not None:
             self._logger.info("Окно закрыто.")
+
             for handler in list(self._logger.handlers):
                 handler.close()
                 self._logger.removeHandler(handler)
+
         event.accept()
