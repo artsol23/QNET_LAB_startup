@@ -1,0 +1,23 @@
+# Python virtual environments
+.venv/
+.venv_build/
+.venv-build/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Build artifacts
+#build/
+#dist/
+*.spec
+
+# IDE
+.idea/
+.vscode/
+
+# Logs
+*.log
