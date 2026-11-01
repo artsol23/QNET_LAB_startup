@@ -78,13 +78,15 @@ neural_service.py — нейросетевой backend Q-Net Lab. В файле 
 * Бенчмарки LDA/QDA на MTV (табл. V) и классификатор ближайшего центроида.
 
 Режимы модели (ТЗ: «2 различных модели нейросетей: FNN, фильтрация+FNN»)
-* ``raw``     — FNN по развёрнутым временным I и Q (базовая FNN [1] статьи);
+* ``raw``     — FNN по развёрнутым временным I и Q (без фильтров; вариант ТЗ,
+  в статье [1] не описан);
 * ``matched`` — банк фильтров QMF/RMF/EMF + FNN (предложенная статьёй схема).
 """
 from __future__ import annotations
 
 import copy
 import csv
+import functools
 import itertools
 import math
 from pathlib import Path
@@ -95,6 +97,30 @@ import torch
 from torch import nn
 
 from device_runtime import resolve_device, prepare_model_transfer
+
+
+def _rollback_on_failure(method):
+    """Откатить сеть, если обучение не завершилось.
+
+    Снимок берётся до первого изменения состояния, поэтому исключение
+    (например, NaN в loss) или отмена до конца первой эпохи оставляют
+    прежние модель, фильтры, нормировку и счётчики.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        state = self._keep_state()
+        try:
+            report = method(self, *args, **kwargs)
+        except BaseException:
+            self._restore_state(state)
+            raise
+        if report["cancelled"] and report["epochs_completed"] == 0:
+            self._restore_state(state)
+        return report
+
+    return wrapper
+
 
 class NeuralService:
     """Сервис текущей нейросети: данные → фильтры → FNN → метрики.
@@ -351,11 +377,19 @@ class NeuralService:
 
     @classmethod
     def _int_list(cls, values, name, minimum=0) -> list[int]:
-        """Список целых чисел (строка вида '64, 32' тоже допускается)."""
+        """Список целых чисел; допускаются строка '64, 32' и одиночное число."""
         if isinstance(values, str):
             values = [v for v in values.replace(";", ",").split(",") if v.strip()]
-            values = [float(v) for v in values]
-        return [cls._int(v, name, minimum) for v in values]
+            try:
+                values = [float(v) for v in values]
+            except ValueError as exc:
+                raise ValueError(f"{name}: требуется список целых чисел через запятую.") from exc
+        elif isinstance(values, (int, float, np.integer, np.floating)) and not isinstance(values, (bool, np.bool_)):
+            values = [values]
+        try:
+            return [cls._int(v, name, minimum) for v in values]
+        except TypeError as exc:
+            raise ValueError(f"{name}: требуется список целых чисел.") from exc
 
     # ------------------------------------------------------------------
     # Загрузка данных
@@ -918,7 +952,7 @@ class NeuralService:
             entry = {"labels": None if data["labels"] is None else data["labels"][indices, channel]}
             if features is not None:
                 cols = [j for j, d in enumerate(self.filters["descriptions"]) if d["atom"] == a]
-                entry["names"] = [self._kernel_name(self.filters["descriptions"][j]) for j in cols]
+                entry["names"] = [self.kernel_name(self.filters["descriptions"][j]) for j in cols]
                 entry["values"] = features[:, cols]
                 entry["kernels"] = np.array([self.filters["kernels"][j] for j in cols])
                 entry["available"] = [self.filters["descriptions"][j]["available"] for j in cols]
@@ -938,7 +972,8 @@ class NeuralService:
         return result
 
     @staticmethod
-    def _kernel_name(d) -> str:
+    def kernel_name(d) -> str:
+        """Подпись фильтра для таблиц и графиков: «QMF 0→1»."""
         return f"{d['kind']} {d['source']}→{d['target']}" + ("" if d["available"] else " (н/д)")
 
     # ------------------------------------------------------------------
@@ -987,11 +1022,16 @@ class NeuralService:
             raise ValueError("Нет такого атома в данных.")
         k = self._int(n_clusters, "Число кластеров", 2)
         indices = self._indices(data, indices)
+        if k > len(indices):
+            raise ValueError(f"Кластеров ({k}) больше, чем трасс ({len(indices)}).")
         mtv = self.mean_trace_value(data["iq"][indices, atom])
         prepared = data["labels"][indices, atom]
         rng = np.random.default_rng(seed)
-        sample = indices if len(indices) <= max_points else rng.choice(len(indices), max_points, replace=False)
-        sample = np.arange(len(indices)) if len(indices) <= max_points else np.sort(sample)
+        max_points = self._int(max_points, "max_points", 2)
+        if len(indices) <= max_points:
+            sample = np.arange(len(indices))
+        else:
+            sample = np.sort(rng.choice(len(indices), max_points, replace=False))
         pts = np.stack([mtv[sample].real, mtv[sample].imag], axis=1).astype(float)
         diff = pts[:, None, :] - pts[None, :, :]
         d2 = (diff ** 2).sum(-1)
@@ -1054,6 +1094,8 @@ class NeuralService:
         :returns: новые метки атома для ``indices``.
         """
         data = self._check_data(data)
+        if data["labels"] is None:
+            raise ValueError("Для разметки утечки нужны метки подготовленных состояний.")
         indices = self._indices(data, indices)
         atom = proposal["atom"]
         mtv = self.mean_trace_value(data["iq"][indices, atom])
@@ -1131,6 +1173,7 @@ class NeuralService:
     # ------------------------------------------------------------------
     # Обучение
     # ------------------------------------------------------------------
+    @_rollback_on_failure
     def train(self, data, *, train_indices=None, val_indices=None, val_data=None, config=None,
               epochs=50, batch_size=256, optimizer="Adam", learning_rate=1e-3, weight_decay=0.0,
               momentum=0.9, fine_tune=False, callback: Callable[[dict], None] | None = None,
@@ -1139,7 +1182,11 @@ class NeuralService:
 
         **Новое обучение** (``fine_tune=False``): по train калибруются
         фильтры и нормировка, строится новая сеть, и только затем она
-        заменяет текущую (при ошибке калибровки прежняя модель цела).
+        заменяет текущую.
+
+        Сеть меняется только по итогам запуска: при исключении (NaN в loss,
+        ошибка данных) прежние модель, веса, фильтры и нормировка
+        восстанавливаются, а отмена до конца первой эпохи их не трогает.
 
         **Дообучение** (``fine_tune=True``): продолжается обучение текущих
         (обученных или загруженных из файла) весов. Фильтры, нормировка и
@@ -1166,6 +1213,7 @@ class NeuralService:
             val_macro_f1, val_xeb, lr).
         :param cancel_event: ``threading.Event``; если установлен — обучение
             останавливается после текущего батча, достигнутые веса остаются.
+            Отмена до конца первой эпохи сеть не меняет.
         :returns: ``{"cancelled", "epochs_completed", "total_epochs",
             "last", "warnings", "excluded"}``.
         """
@@ -1312,6 +1360,26 @@ class NeuralService:
             self.model.eval()
         return dict(cancelled=cancelled, epochs_completed=completed, total_epochs=self.trained_epochs,
                     last=last, warnings=warnings, excluded=excluded_train)
+
+    # Поля обученной сети: снимок до запуска, восстановление при неудаче.
+    _STATE_FIELDS = (
+        "_fitted", "config", "filters", "model", "normalizer", "feature_count",
+        "input_channels", "input_samples", "optimizer_state", "optimizer_name",
+        "trained_epochs", "update_steps",
+    )
+
+    def _keep_state(self) -> dict:
+        """Снимок сети и весов — для отката, если обучение не завершится."""
+        weights = copy.deepcopy(self.model.state_dict()) if self.model is not None else None
+        return dict(weights=weights, **{name: getattr(self, name) for name in self._STATE_FIELDS})
+
+    def _restore_state(self, state: dict) -> None:
+        """Вернуть сеть, веса и счётчики к снимку :meth:`_keep_state`."""
+        for name in self._STATE_FIELDS:
+            setattr(self, name, state[name])
+        if state["weights"] is not None:
+            self.model.load_state_dict(state["weights"])
+            self.model.eval()
 
     @staticmethod
     def _comparable(config):
@@ -1514,11 +1582,14 @@ class NeuralService:
     def validate(self, data, indices=None, *, batch_size=4096, f01_ghz=None) -> dict:
         """Валидировать модель на размеченных данных и построить бенчмарки.
 
-        Возвращает всё, что нужно для графиков режима «Валидация»:
+        Возвращает всё, что нужно для графиков режима «Валидация». Метрики
+        модели (:meth:`_metrics`) лежат в корне словаря:
 
-        * ``metrics`` — accuracy/score, assignment fidelity F_nQ, macro-F1,
-          loss, XEB (по меткам и linear по ideal_probs), а также accuracy
-          бенчмарков ``centroid``, ``lda``, ``qda`` (на MTV);
+        * accuracy/score, assignment fidelity F_nQ, macro-F1, loss, XEB
+          (по меткам и linear по ideal_probs), а также accuracy бенчмарков
+          ``centroid``, ``lda``, ``qda`` (на MTV) — поля ``accuracy``,
+          ``score``, ``assignment_fidelity``, ``macro_f1``, ``loss``,
+          ``xeb_labels``, ``xeb_linear``, ``benchmarks``;
         * ``per_atom`` — для каждого атома: матрица ошибок, fidelity, ошибки
           распада ``decay_error[i] = P(предсказан уровень < i | подготовлен i)``
           и возбуждения ``excitation_error[i]``, бенчмарки, разделение пятен

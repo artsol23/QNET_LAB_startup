@@ -134,6 +134,9 @@ class MainWindow(QMainWindow):
         self._pending_log: list[tuple[int, str]] = []   # журнал до создания проекта
         self._logger: logging.Logger | None = None
         self._run_log: str | None = None          # CSV эпох текущего запуска
+        self._train_rollback: tuple | None = None  # история до запуска: откат при неудаче
+        self._epoch_offset = 0                    # номер первой эпохи (fine-tune продолжает счёт)
+        self._training_fine_tune = False          # текущий запуск — дообучение
         # --- фоновые задачи ---
         self._tasks = TaskRunner()
         self._busy = False
@@ -777,7 +780,7 @@ class MainWindow(QMainWindow):
         names = []
         if cfg["mode"] == "matched":
             order = {"QMF": 0, "RMF": 1, "EMF": 2}
-            unique = {(order.get(d["kind"], 9), d["source"], d["target"]): NeuralService._kernel_name(d).replace(" (н/д)", "")
+            unique = {(order.get(d["kind"], 9), d["source"], d["target"]): NeuralService.kernel_name(d).replace(" (н/д)", "")
                       for d in self.service.filters["descriptions"]}
             names = [unique[key] for key in sorted(unique)]
             available = sum(d["available"] for d in self.service.filters["descriptions"])
@@ -994,6 +997,7 @@ class MainWindow(QMainWindow):
     def _reset_state(self):
         self.train_data = self.eval_data = self.split = None
         self.history, self.train_eval, self.result, self.diagnostics, self.leakage = [], None, None, None, None
+        self._train_rollback = None
         self.current_weights = None
         self.model_fingerprint = None
         self.service = NeuralService(device=str(self.service.device))
@@ -1353,7 +1357,8 @@ class MainWindow(QMainWindow):
             self.result_metadata = None
             self.eval_info.setText(self._describe_data(data, "eval"))
         self._refresh_atoms()
-        self._write_json(self.project_dir / "project.json", self._manifest_now())
+        self.manifest = self._manifest_now()
+        self._write_json(self.project_dir / "project.json", self.manifest)
         self._log(f"Загружены данные ({role}): {entry['original']} — {self._describe_data(data, role)}")
 
     @staticmethod
@@ -1419,13 +1424,17 @@ class MainWindow(QMainWindow):
             self.split_info.setText(self._split_text())
             self.train_eval = None   # история текущей модели сохраняется
             if self.project_dir is not None:
-                self._write_json(self.project_dir / "project.json", self._manifest_now())
+                self.manifest = self._manifest_now()
+                self._write_json(self.project_dir / "project.json", self.manifest)
             self._log(self._split_text())
         if quiet:
             try:
                 work()
-            except ValueError:
-                pass
+            except ValueError as exc:
+                # Автоматическое разделение после загрузки данных: диалог не
+                # показываем, но причину пишем в журнал — иначе отсутствие
+                # разбиения выглядит как сбой.
+                self._log(f"Автоматическое разделение данных не выполнено: {exc}")
         else:
             self._guard(work)
 
@@ -1507,10 +1516,20 @@ class MainWindow(QMainWindow):
         path = self._unique("data", "labels_leakage", ".npy")
         np.save(path, labels)
         self.manifest["datasets"]["train"]["labels_override"] = self._relative(path)
-        self._write_json(self.project_dir / "project.json", self._manifest_now())
+        self.manifest = self._manifest_now()
+        self._write_json(self.project_dir / "project.json", self.manifest)
         self.train_info.setText(self._describe_data(self.train_data, "train"))
-        levels = [int(v) + 1 for v in labels.max(axis=0)]
-        self.levels_edit.setText(", ".join(map(str, np.maximum(levels, 2))))
+        # Число уровней только растёт: явно заданное пользователем значение
+        # (например, 3 для кудита) не должно уменьшиться из-за меток утечки.
+        from_labels = [int(v) + 1 for v in labels.max(axis=0)]
+        try:
+            current = self._ints(self.levels_edit.text(), "Уровни")
+        except ValueError:
+            current = []
+        if len(current) != len(from_labels):
+            current = from_labels
+        levels = [max(a, b) for a, b in zip(current, from_labels)]
+        self.levels_edit.setText(", ".join(map(str, levels)))
         self._log(f"Метки утечки применены (train, validation, test) и сохранены: {path.name}; "
                   "подготовленные метки сохранены отдельно.")
 
@@ -1686,6 +1705,8 @@ class MainWindow(QMainWindow):
         parameters = dict(epochs=epochs, batch_size=self.batch_spin.value(), optimizer=self.optimizer_combo.currentText(),
                           learning_rate=lr, weight_decay=self.wd_spin.value(), momentum=self.momentum_spin.value())
         self._run_log = self._relative(self._unique("logs", "finetune" if fine_tune else "training", ".csv"))
+        # Снимок: если обучение не изменит сеть, история и метрики останутся в силе.
+        self._train_rollback = (list(self.history), self.train_eval, self.train_summary.text(), self._run_log)
         if not fine_tune:
             self.history = []
         self.train_eval = None
@@ -1751,22 +1772,57 @@ class MainWindow(QMainWindow):
                 f"score {fmt(row['accuracy'], True)} / val {fmt(row.get('val_accuracy'), True)}; "
                 f"F_nQ {fmt(row.get('val_assignment_fidelity'), True)}; XEB {fmt(row.get('val_xeb'))}")
 
-    def _training_done(self, payload):
-        report, evaluation, failure = payload
-        # Прежние результаты валидации/классификации относятся к другой модели.
+    def _discard_results(self):
+        """Сбросить результаты валидации: они относятся к прежней модели."""
         self.result, self.diagnostics = None, None
         self.result_metadata = None
         self.val_summary.setText("Модель изменена: выполните валидацию или классификацию заново.")
         self.details.clear()
+
+    def _restore_train_state(self):
+        """Вернуть историю эпох: прерванный запуск сеть не изменил."""
+        if self._train_rollback is None:
+            return
+        self.history, self.train_eval, summary, log = self._train_rollback
+        self.train_summary.setText(summary)
+        self._train_rollback = None
+        if log and self.project_dir is not None:
+            # Журнал описывает отброшенные эпохи — убираем, чтобы он не попал
+            # в список истории проекта.
+            try:
+                self._inside(log).unlink(missing_ok=True)
+            except OSError as exc:
+                self._log(f"Не удалось удалить журнал прерванного запуска {log}: {exc}",
+                          logging.WARNING)
+        self._run_log = None
+        self._schedule_redraw()
+
+    def _training_done(self, payload):
+        report, evaluation, failure = payload
+
         if failure is not None:
             error, changed = failure
             if changed:
-                # Веса успели обновиться: модель отличается от сохранённого файла.
+                # Веса успели обновиться: прежние результаты к модели не относятся.
+                self._discard_results()
+                self._train_rollback = None
                 self.current_weights = None
                 self.model_fingerprint = "mixed"
                 self._set_dirty(True)
+            else:
+                # Сеть откачена к прежней — история и результаты остаются рабочими.
+                self._restore_train_state()
             self._error(error, "Ошибка обучения")
             return
+
+        if report["cancelled"] and report["epochs_completed"] == 0:
+            # Отмена до конца первой эпохи: сеть не менялась.
+            self._restore_train_state()
+            self._log("Обучение отменено до конца первой эпохи: прежняя модель сохранена.")
+            return
+
+        self._discard_results()
+        self._train_rollback = None
         self.train_eval = evaluation
         fingerprint = self._train_fingerprint()
         # Дообучение на другом train смешивает выборки: независимость test неизвестна.
@@ -1786,7 +1842,8 @@ class MainWindow(QMainWindow):
         if evaluation is not None:
             self.train_summary.setText(self.train_summary.text() + "\nValidation после обучения: "
                                        + self._metrics_text(evaluation))
-        self._write_json(self.project_dir / "project.json", self._manifest_now() | {"current_weights": None})
+        self.manifest = self._manifest_now() | {"current_weights": None}
+        self._write_json(self.project_dir / "project.json", self.manifest)
 
     def _run_evaluation(
         self,
@@ -2543,13 +2600,6 @@ class MainWindow(QMainWindow):
 
         self.train_canvas.draw_idle()
 
-    def _draw_confusions(self, ax, result):
-        plotting.draw_confusions(
-            ax,
-            result,
-            self._selected_atoms(),
-        )
-
     @staticmethod
     def _finish(fig, canvas):
         plotting.finish_figure(fig)
@@ -2660,7 +2710,7 @@ class MainWindow(QMainWindow):
 
             kernels.append({
                 "channel": channel,
-                "name": NeuralService._kernel_name(description),
+                "name": NeuralService.kernel_name(description),
                 "values": kernel,
             })
 
