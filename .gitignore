@@ -24,5 +24,9 @@ startup-*.txt
 make_installer.bat
 installer-output/
 
+# Большие наборы реальных данных — не для git (сотни МБ)
+examples/Q13.npz
+examples/q13_2qubits.npz
+
 
 
