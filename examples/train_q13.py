@@ -18,7 +18,6 @@ import sys
 import time
 
 import numpy as np
-import torch
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -96,10 +95,6 @@ def main(argv=None):
     parser.add_argument("--hidden", type=int, nargs="+", default=[22, 11])
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
-
-    # Сеть крошечная, и накладные расходы пула потоков torch больше самой работы:
-    # на 30 ядрах обучение идёт в сотню раз медленнее, чем на одном потоке.
-    torch.set_num_threads(1)
 
     data = load(args.data)
     n = len(data["labels"])

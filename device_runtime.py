@@ -3,8 +3,35 @@
 from __future__ import annotations
 
 import copy
+import os
 
 import torch
+
+#: Предел потоков CPU для режима raw: выше него выигрыша нет.
+MAX_CPU_THREADS = 8
+
+
+def cpu_threads(mode: str) -> int:
+    """Сколько потоков CPU отдать расчёту в данном режиме.
+
+    Замер на 32-ядерной машине (Q13, батч 256, 5 эпох). В режиме matched
+    вход сети — единицы признаков (P = 6), работа на один батч меньше
+    затрат на синхронизацию потоков, и обучение на 16 потоках шло в 60 раз
+    медленнее, чем на одном. В режиме raw вход 2·A·T (сотни–тысячи
+    значений), потоки уже полезны: сеть [256, 128] на 8 потоках втрое
+    быстрее, чем на одном, а на 16 потоках снова чуть медленнее.
+    """
+    if mode != "raw":
+        return 1
+    return max(1, min(MAX_CPU_THREADS, os.cpu_count() or 1))
+
+
+def apply_cpu_threads(mode: str) -> int:
+    """Применить :func:`cpu_threads` к PyTorch; вернуть число потоков."""
+    threads = cpu_threads(mode)
+    if torch.get_num_threads() != threads:
+        torch.set_num_threads(threads)
+    return threads
 
 
 def resolve_device(name: str) -> torch.device:

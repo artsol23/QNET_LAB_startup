@@ -96,7 +96,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from device_runtime import resolve_device, prepare_model_transfer
+from device_runtime import apply_cpu_threads, resolve_device, prepare_model_transfer
 
 
 def _rollback_on_failure(method):
@@ -1247,6 +1247,8 @@ class NeuralService:
             samples = data["iq"].shape[2]
             if window is not None and not (0 <= window[0] < window[1] <= samples):
                 raise ValueError(f"Окно {window} выходит за пределы трассы из {samples} отсчётов.")
+        # Потоки CPU — до начала счёта: в matched пул потоков только мешает.
+        apply_cpu_threads(config["mode"])
         train_idx, excluded_train = self._usable(data, self._indices(data, train_indices), config)
         if len(train_idx) < 2:
             raise ValueError("После проверки меток в train осталось меньше двух измерений.")
@@ -1440,6 +1442,7 @@ class NeuralService:
     # ------------------------------------------------------------------
     def _evaluate(self, data, indices, batch_size, keep=False) -> dict:
         """Прогнать сеть по данным: confusion-матрицы, loss и (опционально) выходы."""
+        apply_cpu_threads(self.config["mode"])
         levels = self.config["levels"]
         atoms = self.config["atoms"]
         conf = [np.zeros((k, k), np.int64) for k in levels]

@@ -16,8 +16,6 @@ import argparse
 import pathlib
 import sys
 
-import torch
-
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
@@ -34,8 +32,6 @@ def main(argv=None):
                         help="размер скрытых слоёв; можно повторить (по умолчанию %s)" % SIZES)
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 7])
     args = parser.parse_args(argv)
-
-    torch.set_num_threads(1)
 
     data = load(args.data)
     train_idx, val_idx, test_idx = split(len(data["labels"]))
