@@ -17,11 +17,15 @@ import pathlib
 import sys
 import time
 
-import numpy as np
-
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
+from blas_threads import limit_blas_threads  # noqa: E402
+
+# До первого import numpy: OpenBLAS читает число потоков при загрузке.
+limit_blas_threads()
+
+import numpy as np  # noqa: E402
 from neural_service import NeuralService  # noqa: E402
 
 DATA = HERE / "q13_2qubits.npz"

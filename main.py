@@ -33,7 +33,13 @@ import sys
 import traceback
 from pathlib import Path
 
-from license_manager import LicenseManager
+from blas_threads import limit_blas_threads
+
+# Число потоков BLAS читается при загрузке библиотеки, то есть при первом
+# import numpy, поэтому ограничение ставится раньше остальных импортов.
+limit_blas_threads()
+
+from license_manager import LicenseManager  # noqa: E402
 
 #: Папка приложения: от неё ищутся public_key.pem и license.json, а не от
 #: текущего рабочего каталога (в PyCharm он может быть другим).
