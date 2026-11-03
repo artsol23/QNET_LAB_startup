@@ -2046,13 +2046,17 @@ class MainWindow(QMainWindow):
         return entry["file"]
 
     def save_weights(self):
-        """Сохранить новый набор весов и обновить проект."""
-        self._save_project_async(force_weights=True)
+        """Сохранить новый набор весов и обновить проект.
 
-        def save():
-            self._export_weights_now()
-            self._save_project_now(save_weights=False)
-        self._guard(save)
+        Сохранение выполняется только в рабочем потоке. Раньше здесь
+        дополнительно запускался синхронный экспорт в главном потоке:
+        два экспорта писали один и тот же файл весов и один и тот же
+        project.json, а запись в реестр терялась.
+        """
+        if self._busy:
+            self._error("Дождитесь завершения текущей операции.")
+            return
+        self._save_project_async(force_weights=True)
 
     def _refresh_weights_list(self):
         self.weights_list.clear()
@@ -2130,20 +2134,6 @@ class MainWindow(QMainWindow):
             work,
             self._weights_loaded,
         )
-
-        def work():
-            target = path
-            if copy_into_project:
-                target = self._unique("weights", "imported", ".pt")
-                shutil.copy2(path, target)
-            try:
-                info = self.service.load_weights(target)
-            except Exception:
-                if copy_into_project:
-                    target.unlink(missing_ok=True)
-                raise
-            return target, info
-        self._run("Загрузка весов", work, self._weights_loaded)
 
     def _weights_loaded(self, payload):
         target, info = payload
