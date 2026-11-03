@@ -32,6 +32,8 @@ DATA = HERE / "q13_2qubits.npz"
 LEVELS = [2, 2]
 ATOMS = [0, 1]
 STATE_NAMES = ("00", "01", "10", "11")
+# Число состояний в одном выстреле: строки файла идут блоками по четыре.
+STATES_PER_SHOT = len(STATE_NAMES)
 
 
 def load(path=DATA):
@@ -45,12 +47,22 @@ def split(n, *, seed=0, test_frac=1 / 6, val_frac=1 / 10):
     Строки файла идут в порядке «выстрел, состояние», поэтому перемешиваются
     именно выстрелы: четыре состояния одного выстрела всегда попадают в одну
     часть и не утекают между train и test.
+
+    :param n: число строк набора; должно быть кратно числу состояний.
     """
-    perm = np.random.default_rng(seed).permutation(n)
-    n_test, n_val = int(n * test_frac), int(n * val_frac)
-    return (np.sort(perm[n_test + n_val:]),      # train
-            np.sort(perm[n_test:n_test + n_val]),  # val
-            np.sort(perm[:n_test]))              # test
+    if n % STATES_PER_SHOT:
+        raise ValueError(f"Число строк {n} не кратно {STATES_PER_SHOT}.")
+    shots = n // STATES_PER_SHOT
+    # Перемешиваем выстрелы, а строки каждого выстрела берём целиком.
+    order = np.sort(np.random.default_rng(seed).permutation(shots))
+    rows = (order[:, None] * STATES_PER_SHOT + np.arange(STATES_PER_SHOT)).ravel()
+    n_test, n_val = int(shots * test_frac), int(shots * val_frac)
+    # Границы частей — по выстрелам, а не по строкам.
+    first_test = n_test * STATES_PER_SHOT
+    first_val = (n_test + n_val) * STATES_PER_SHOT
+    return (np.sort(rows[first_val:]),        # train
+            np.sort(rows[first_test:first_val]),  # val
+            np.sort(rows[:first_test]))       # test
 
 
 def fit(data, train_idx, val_idx, *, hidden=(22, 11), seed=42, epochs=40,
@@ -59,7 +71,7 @@ def fit(data, train_idx, val_idx, *, hidden=(22, 11), seed=42, epochs=40,
     service = NeuralService()
     config = service.configure(LEVELS, list(hidden), atoms=ATOMS, mode="matched", seed=seed)
     started = time.time()
-    result = service.train(data, train_indices=train_idx, val_indices=val_idx, val_data=data,
+    result = service.train(data, train_indices=train_idx, val_indices=val_idx,
                            config=config, epochs=epochs, batch_size=batch_size,
                            learning_rate=learning_rate, callback=on_epoch)
     return service, result, time.time() - started

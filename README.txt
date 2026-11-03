@@ -3,13 +3,24 @@ Q-Net Lab
 состояния кудитов и кубитных регистров по кривым дисперсионного считывания
 (временные трассы квадратур I и Q).
 
-ИСХОДНЫЙ КОД — 4 ФАЙЛА
+ИСХОДНЫЙ КОД
   main.py            — точка входа: заставка, проверка лицензии, запуск окна (классов нет)
-  neural_service.py  — класс NeuralService: данные, фильтры, сеть, обучение, метрики
   mainwindow.py      — класс MainWindow: окно, проект, все файлы, графики
+  neural_service.py  — класс NeuralService: данные, фильтры, сеть, обучение, метрики
   license_manager.py — класс LicenseManager: RSA-лицензия (проверка подписи)
-Остальное — не код: public_key.pem и license.json (лицензия), requirements.txt,
-UserGuide.html (руководство пользователя), examples\ (синтетические демо-данные).
+  project_store.py   — пути проекта, JSON, контроль целостности данных
+  task_runner.py     — фоновые задачи, очередь сообщений, отмена
+  plotting.py        — построение графиков (не зависит от Qt)
+  training_history.py — чтение и очистка журналов обучения
+  result_export.py   — экспорт предсказаний (CSV) и отчётов (JSON)
+  device_runtime.py  — выбор устройства (CPU/CUDA) и число потоков CPU
+  blas_threads.py    — ограничение числа потоков BLAS в NumPy и SciPy
+  app_version.py     — версия приложения
+  tests\             — автоматические тесты (pytest)
+  examples\          — демо-данные и скрипты convert_q13.py, train_q13.py, sweep_q13.py
+  build.bat          — сборка PyInstaller (cpu / cuda / all)
+Не код: public_key.pem и license.json (лицензия), requirements.txt и
+requirements-lock-*.txt, UserGuide.html (руководство пользователя), CHANGELOG.txt.
 
 УСТАНОВКА И ЗАПУСК В PYCHARM (Windows)
  1. File > Open… > папка QNetLab.

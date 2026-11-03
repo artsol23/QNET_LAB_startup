@@ -787,7 +787,7 @@ class NeuralService:
 
         for a, k in enumerate(levels):
             ya = y_all[indices, config["atoms"][a]]   # метки КАНАЛА атома, а не позиции в списке
-            means, var_i, var_q, mtv_stats = [], [], [], []
+            means, var_i, var_q = [], [], []
             for s in range(k):
                 sel = indices[ya == s]
                 if len(sel) < 2:
@@ -1199,8 +1199,10 @@ class NeuralService:
 
         :param data: словарь данных с labels.
         :param train_indices: номера измерений для обучения (None — все).
-        :param val_indices: номера измерений validation из ``data``.
-        :param val_data: отдельный набор для validation (вместо val_indices).
+        :param val_indices: номера измерений validation: из ``data`` либо из
+            ``val_data``, если он задан.
+        :param val_data: отдельный набор для validation. Если заданы и
+            ``val_indices``, берутся только они; иначе — весь ``val_data``.
         :param config: новая конфигурация (результат :meth:`configure`);
             None — текущая.
         :param epochs: число эпох.
@@ -1229,6 +1231,7 @@ class NeuralService:
         if str(optimizer).lower() not in names:
             raise ValueError(f"Оптимизатор: {', '.join(self.OPTIMIZERS)}.")
         optimizer = names[str(optimizer).lower()]
+        source_data = data
         data = self._check_data(data)
         if data["labels"] is None:
             raise ValueError("Для обучения нужны метки (labels).")
@@ -1254,20 +1257,26 @@ class NeuralService:
         if len(train_idx) < 2:
             raise ValueError("После проверки меток в train осталось меньше двух измерений.")
         if val_data is not None:
+            # Тот же набор, что и train? Тогда индексы train и validation
+            # сравнимы и пересечение запрещено.
+            same_source = val_data is source_data
             val_data = self._check_data(val_data)
             if val_data["iq"].shape[2] != data["iq"].shape[2] or max(config["atoms"]) >= val_data["iq"].shape[1]:
                 raise ValueError("Validation-набор должен иметь ту же длину трасс и нужные атомы, что и train.")
             if (data["time_ns"] is None) != (val_data["time_ns"] is None) or (
                     data["time_ns"] is not None and not np.allclose(data["time_ns"], val_data["time_ns"], rtol=1e-6)):
                 raise ValueError("Временные сетки train и validation различаются.")
-            val_idx, _ = self._usable(val_data, self._indices(val_data, None), config)
+            # Если заданы val_indices, они относятся к val_data, а не ко всему набору.
+            val_idx, _ = self._usable(val_data, self._indices(val_data, val_indices), config)
         elif val_indices is not None:
+            same_source = True
             val_data = data
             val_idx, _ = self._usable(data, self._indices(data, val_indices), config)
-            if np.intersect1d(val_idx, train_idx).size:
-                raise ValueError("Train и validation пересекаются — передайте непересекающиеся индексы.")
         else:
+            same_source = True
             val_idx = None
+        if same_source and val_idx is not None and np.intersect1d(val_idx, train_idx).size:
+            raise ValueError("Train и validation пересекаются — передайте непересекающиеся индексы.")
         warnings = []
         if excluded_train:
             warnings.append(f"Из train исключено {excluded_train} измерений с уровнями выше заданных.")

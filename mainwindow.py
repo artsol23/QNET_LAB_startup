@@ -1635,12 +1635,21 @@ class MainWindow(QMainWindow):
         """Задать learning rate точно и подвинуть ползунок к тому же значению.
 
         Значение в поле не округляется до положения ползунка: ползунок
-        показывает ближайшее значение логарифмической шкалы.
+        показывает ближайшее значение логарифмической шкалы. Значение из
+        project.json может быть любым, поэтому негодное игнорируется.
         """
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(number) or number <= 0:
+            return
         self._lr_updating = True
         try:
-            self.lr_spin.setValue(float(value))
-            position = int(round(10 * math.log10(float(value))))
+            self.lr_spin.setValue(number)
+            # Поле ограничивает диапазон, положение считаем по его значению.
+            effective = float(self.lr_spin.value())
+            position = int(round(10 * math.log10(effective)))
             position = max(self.lr_slider.minimum(), min(self.lr_slider.maximum(), position))
             self.lr_slider.setValue(position)
         finally:
