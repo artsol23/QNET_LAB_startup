@@ -58,6 +58,7 @@ import csv
 import hashlib
 import json
 import logging
+import math
 import shutil
 import traceback
 from datetime import datetime
@@ -523,7 +524,12 @@ class MainWindow(QMainWindow):
         form.addRow("Оптимизатор", self.optimizer_combo)
         self.lr_slider = self._slider(-60, -10, -25)
         self.lr_spin = self._dspin(1e-6, 0.1, 3e-3, 1e-4, 6)
-        self.lr_slider.valueChanged.connect(lambda v: self.lr_spin.setValue(10 ** (v / 10)))
+        # Ползунок и поле связаны в обе стороны: значение learning rate
+        # берётся из поля, ползунок показывает его же.
+        self._lr_updating = False
+        self.lr_slider.valueChanged.connect(self._on_lr_slider)
+        self.lr_spin.valueChanged.connect(self._on_lr_spin)
+        self._set_learning_rate(self.lr_spin.value())
         row = QHBoxLayout()
         row.addWidget(self.lr_slider)
         row.addWidget(self.lr_spin)
@@ -1609,6 +1615,37 @@ class MainWindow(QMainWindow):
         self.reg_spin.setValue(fc["regularization"])
         self.min_events_spin.setValue(fc["min_events"])
 
+    def _on_lr_slider(self, value: int) -> None:
+        """Learning rate по положению ползунка (логарифмическая шкала)."""
+        if self._lr_updating:
+            return
+        self._lr_updating = True
+        try:
+            self.lr_spin.setValue(10 ** (value / 10))
+        finally:
+            self._lr_updating = False
+
+    def _on_lr_spin(self, value: float) -> None:
+        """Положение ползунка по learning rate (логарифмическая шкала)."""
+        if self._lr_updating:
+            return
+        self._set_learning_rate(value)
+
+    def _set_learning_rate(self, value: float) -> None:
+        """Задать learning rate точно и подвинуть ползунок к тому же значению.
+
+        Значение в поле не округляется до положения ползунка: ползунок
+        показывает ближайшее значение логарифмической шкалы.
+        """
+        self._lr_updating = True
+        try:
+            self.lr_spin.setValue(float(value))
+            position = int(round(10 * math.log10(float(value))))
+            position = max(self.lr_slider.minimum(), min(self.lr_slider.maximum(), position))
+            self.lr_slider.setValue(position)
+        finally:
+            self._lr_updating = False
+
     def _form_settings(self) -> dict:
         """Параметры интерфейса, которые сохраняются в project.json."""
         return dict(atoms=self.atoms_edit.text(), levels=self.levels_edit.text(),
@@ -1635,7 +1672,7 @@ class MainWindow(QMainWindow):
             self.atoms_edit.setText(s.get("atoms", self.atoms_edit.text()))
             self.levels_edit.setText(s.get("levels", self.levels_edit.text()))
             self.optimizer_combo.setCurrentText(s.get("optimizer", "Adam"))
-            self.lr_spin.setValue(float(s.get("lr", 1e-3)))
+            self._set_learning_rate(float(s.get("lr", 1e-3)))
             self.wd_spin.setValue(float(s.get("weight_decay", 0)))
             self.momentum_spin.setValue(float(s.get("momentum", 0.9)))
             self.epochs_spin.setValue(int(s.get("epochs", 40)))

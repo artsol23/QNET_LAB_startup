@@ -91,6 +91,7 @@ import itertools
 import math
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -1271,7 +1272,8 @@ class NeuralService:
         if excluded_train:
             warnings.append(f"Из train исключено {excluded_train} измерений с уровнями выше заданных.")
         if self._cancelled(cancel_event):
-            return dict(cancelled=True, epochs_completed=0, total_epochs=self.trained_epochs, last={}, warnings=warnings)
+            return dict(cancelled=True, epochs_completed=0, total_epochs=self.trained_epochs, last={},
+                        warnings=warnings, excluded=excluded_train)
 
         if not fine_tune:
             # Кандидат: всё считается в локальных переменных, затем атомарная замена.
@@ -1334,12 +1336,20 @@ class NeuralService:
                         raise ValueError("Loss стал NaN/Inf — уменьшите learning rate и проверьте данные.")
                     loss.backward()
                     nn.utils.clip_grad_norm_(self.model.parameters(), 10.0)
+                    with torch.no_grad():
+                        # Точность обучения считается без dropout: в режиме train
+                        # она зависела от случайного маскирования и потому была
+                        # несопоставима с точностью на validation.
+                        self.model.eval()
+                        try:
+                            clean = self._logits(features)
+                        finally:
+                            self.model.train()
+                        pred = torch.stack([h.argmax(1) for h in self._split_logits(clean)], 1)
+                        right += int(torch.all(pred == target, dim=1).sum())
                     opt.step()
                     self.update_steps += 1
                     self._fitted = True
-                    with torch.no_grad():
-                        pred = torch.stack([h.argmax(1) for h in self._split_logits(logits)], 1)
-                        right += int(torch.all(pred == target, dim=1).sum())
                     seen += len(b)
                     loss_sum += loss.item() * len(b)
                 if cancelled:
@@ -1517,7 +1527,7 @@ class NeuralService:
             precision = np.divide(np.diag(cm), col, out=np.zeros(len(cm)), where=col > 0)
             f1 = np.divide(2 * precision * recall, precision + recall, out=np.zeros(len(cm)),
                            where=(precision + recall) > 0)
-            fid = float(recall[support > 0].mean()) if np.all(support > 0) else None
+            fid = float(recall[support > 0].mean()) if np.any(support > 0) else None
             down = [float(cm[i, :i].sum() / support[i]) if support[i] else None for i in range(len(cm))]
             up = [float(cm[i, i + 1:].sum() / support[i]) if support[i] else None for i in range(len(cm))]
             out["per_atom"].append(dict(atom=self.config["atoms"][a], confusion=cm, support=support,
@@ -1879,7 +1889,7 @@ class NeuralService:
                       optimizer_name=self.optimizer_name,
                       optimizer_state=self.optimizer_state if include_optimizer else None,
                       metadata=self._pack(metadata or {}))
-        temporary = path.with_name(path.name + ".tmp")
+        temporary = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
         try:
             torch.save(bundle, temporary)
             temporary.replace(path)

@@ -8,6 +8,7 @@ import math
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
+from uuid import uuid4
 
 import numpy as np
 
@@ -100,18 +101,24 @@ class ProjectStore:
         return value
 
     def write_json(self, path: Path, payload) -> None:
-        """Записать JSON через временный файл и атомарное переименование."""
-        temporary = path.with_name(path.name + ".tmp")
+        """Записать JSON через временный файл и атомарное переименование.
 
-        temporary.write_text(
-            json.dumps(
-                self.jsonable(payload),
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        temporary.replace(path)
+        Имя временного файла уникально: главный поток и рабочий поток
+        могут писать один и тот же project.json одновременно.
+        """
+        temporary = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(
+                    self.jsonable(payload),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def read_dataset(
         self,
