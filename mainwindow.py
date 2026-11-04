@@ -60,6 +60,7 @@ import json
 import logging
 import math
 import shutil
+import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -1237,8 +1238,30 @@ class MainWindow(QMainWindow):
         """Открыть существующий проект (project.json) и восстановить сессию."""
         if self._busy:
             return
-        selected, _ = QFileDialog.getOpenFileName(self, "Открыть проект", "", "Проект Q-Net Lab (project.json)")
+        start = str(self.project_dir) if self.project_dir is not None else ""
+        # На Linux системный диалог GTK при выборе папки подвешивает окно,
+        # поэтому там используется собственный диалог Qt. На Windows остаётся
+        # нативный, как раньше.
+        options = (QFileDialog.Option.DontUseNativeDialog
+                   if sys.platform.startswith("linux") else QFileDialog.Option(0))
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Открыть проект",
+            start,
+            "Проект Q-Net Lab (*.json)",
+            options=options,
+        )
         if not selected:
+            return
+        chosen = Path(selected)
+        if chosen.is_dir():
+            self._error(ValueError(
+                f"Выбрана папка «{chosen.name}», а не файл проекта. "
+                "Откройте внутри неё файл project.json."
+            ))
+            return
+        if not chosen.is_file():
+            self._error(ValueError(f"Файл проекта не найден: {chosen}"))
             return
 
         device_name = str(self.service.device)
