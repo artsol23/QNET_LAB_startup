@@ -30,6 +30,8 @@ class OpenProjectTests(unittest.TestCase):
             calls.append(("run", title))
 
         state = SimpleNamespace(
+            PROJECT_FORMAT="qnetlab-project",
+            PROJECT_VERSION=2,
             _busy=False,
             project_dir=None,
             service=SimpleNamespace(device="cpu"),
@@ -67,6 +69,41 @@ class OpenProjectTests(unittest.TestCase):
         self.open_with(state, ("/tmp/qnet_missing_project.json", ""))
         self.assertEqual([name for name, *_ in calls], ["error"])
         self.assertIn("не найден", calls[0][1])
+
+    def test_open_returns_manifest_name(self):
+        state, calls = self.make_state()
+
+        def run(title, work, done, **kwargs):
+            calls.append(("run", work))
+
+        state._run = run
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "my_project.json"
+            path.write_text('{"format": "qnetlab-project", "version": 2}', encoding="utf-8")
+            self.open_with(state, (str(path), ""))
+            restored = calls[0][1]()
+
+        self.assertEqual(restored["manifest_name"], "my_project.json")
+        self.assertEqual(restored["folder"], Path(folder).resolve())
+
+    def test_save_writes_opened_manifest(self):
+        written = []
+        state = SimpleNamespace(
+            project_dir=Path("/tmp/qnet_project"),
+            manifest_name="my_project.json",
+            service=SimpleNamespace(is_fitted=False),
+            dirty=False,
+            current_weights=None,
+            _require_project=lambda: None,
+            _manifest_now=lambda: {"format": "qnetlab-project", "version": 2},
+            _write_json=lambda path, payload: written.append(path),
+            _set_dirty=lambda value: None,
+        )
+        state._manifest_path = lambda: state.project_dir / state.manifest_name
+
+        MainWindow._save_project_now(state)
+
+        self.assertEqual([path.name for path in written], ["my_project.json"])
 
     def test_file_starts_loading_with_qt_dialog(self):
         state, calls = self.make_state()

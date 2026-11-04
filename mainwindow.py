@@ -119,6 +119,7 @@ class MainWindow(QMainWindow):
         self.license_info = license_info or {}
         # --- данные и состояние, которыми владеет окно ---
         self.project_dir: Path | None = None
+        self.manifest_name = "project.json"        # имя открытого манифеста
         self.manifest: dict = {}
         self.train_data: dict | None = None       # обучающий набор (весь)
         self.eval_data: dict | None = None        # экспериментальный набор
@@ -824,6 +825,10 @@ class MainWindow(QMainWindow):
     def _inside(self, relative: str) -> Path:
         return ProjectStore(self.project_dir).inside(relative)
 
+    def _manifest_path(self) -> Path:
+        """Путь манифеста: имя сохраняется таким, каким проект открыли."""
+        return self.project_dir / self.manifest_name
+
     _sha256 = staticmethod(ProjectStore.sha256)
     _jsonable = staticmethod(ProjectStore.jsonable)
 
@@ -1003,6 +1008,7 @@ class MainWindow(QMainWindow):
 
     def _reset_state(self):
         self.train_data = self.eval_data = self.split = None
+        self.manifest_name = "project.json"
         self.history, self.train_eval, self.result, self.diagnostics, self.leakage = [], None, None, None, None
         self._train_rollback = None
         self.current_weights = None
@@ -1061,7 +1067,7 @@ class MainWindow(QMainWindow):
         if save_weights and self.service.is_fitted and (self.dirty or not self.current_weights):
             self._export_weights_now(kind="session")
         self.manifest = self._manifest_now()
-        self._write_json(self.project_dir / "project.json", self.manifest)
+        self._write_json(self._manifest_path(), self.manifest)
         self._set_dirty(False)
 
     def _save_project_async(self, *, force_weights=False, on_success=None):
@@ -1100,6 +1106,7 @@ class MainWindow(QMainWindow):
             # Рабочий поток получит независимую копию манифеста.
             manifest = copy.deepcopy(self._manifest_now())
             project_dir = self.project_dir
+            manifest_name = self.manifest_name
             store = ProjectStore(project_dir)
 
             weights_path = None
@@ -1150,6 +1157,7 @@ class MainWindow(QMainWindow):
                 "service": service,
                 "store": store,
                 "project_dir": project_dir,
+                "manifest_name": manifest_name,
                 "manifest": manifest,
                 "weights_path": weights_path,
                 "weights_entry": weights_entry,
@@ -1182,7 +1190,7 @@ class MainWindow(QMainWindow):
             # Сначала полностью записываем веса.
             # Затем обновляем манифест, который ссылается на них.
             store.write_json(
-                prepared["project_dir"] / "project.json",
+                prepared["project_dir"] / prepared["manifest_name"],
                 manifest,
             )
 
@@ -1272,7 +1280,8 @@ class MainWindow(QMainWindow):
             if manifest.get("format") != self.PROJECT_FORMAT or manifest.get("version") != self.PROJECT_VERSION:
                 raise ValueError("Это не проект Q-Net Lab этой версии.")
             folder = path.parent
-            restored = {"folder": folder, "manifest": manifest, "service": NeuralService(device=device_name), "data": {}, "warnings": []}
+            restored = {"folder": folder, "manifest_name": path.name, "manifest": manifest,
+                        "service": NeuralService(device=device_name), "data": {}, "warnings": []}
             for role, entry in manifest.get("datasets", {}).items():
                 try:
                     restored["data"][role] = (
@@ -1311,6 +1320,7 @@ class MainWindow(QMainWindow):
     def _project_opened(self, restored: dict):
         self._reset_state()
         self.project_dir = restored["folder"]
+        self.manifest_name = restored["manifest_name"]
         self._attach_logger(self.project_dir)
         self.manifest = restored["manifest"]
         self.service = restored["service"]
@@ -1387,7 +1397,7 @@ class MainWindow(QMainWindow):
             self.eval_info.setText(self._describe_data(data, "eval"))
         self._refresh_atoms()
         self.manifest = self._manifest_now()
-        self._write_json(self.project_dir / "project.json", self.manifest)
+        self._write_json(self._manifest_path(), self.manifest)
         self._log(f"Загружены данные ({role}): {entry['original']} — {self._describe_data(data, role)}")
 
     @staticmethod
@@ -1454,7 +1464,7 @@ class MainWindow(QMainWindow):
             self.train_eval = None   # история текущей модели сохраняется
             if self.project_dir is not None:
                 self.manifest = self._manifest_now()
-                self._write_json(self.project_dir / "project.json", self.manifest)
+                self._write_json(self._manifest_path(), self.manifest)
             self._log(self._split_text())
         if quiet:
             try:
@@ -1546,7 +1556,7 @@ class MainWindow(QMainWindow):
         np.save(path, labels)
         self.manifest["datasets"]["train"]["labels_override"] = self._relative(path)
         self.manifest = self._manifest_now()
-        self._write_json(self.project_dir / "project.json", self.manifest)
+        self._write_json(self._manifest_path(), self.manifest)
         self.train_info.setText(self._describe_data(self.train_data, "train"))
         # Число уровней только растёт: явно заданное пользователем значение
         # (например, 3 для кудита) не должно уменьшиться из-за меток утечки.
@@ -1912,7 +1922,7 @@ class MainWindow(QMainWindow):
             self.train_summary.setText(self.train_summary.text() + "\nValidation после обучения: "
                                        + self._metrics_text(evaluation))
         self.manifest = self._manifest_now() | {"current_weights": None}
-        self._write_json(self.project_dir / "project.json", self.manifest)
+        self._write_json(self._manifest_path(), self.manifest)
 
     def _run_evaluation(
         self,
