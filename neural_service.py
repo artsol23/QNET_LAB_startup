@@ -768,9 +768,10 @@ class NeuralService:
            правило ``segments`` — ранний сегмент у c_s, поздний у c_j;
         5. QMF для каждой пары (i<j), RMF для j→i и EMF для i→j: ядро
            строится между средней трассой событий и «чистыми» трассами
-           исходного уровня. Если событий меньше ``min_events``, ядро
-           нулевое (признак всегда 0) и выдаётся предупреждение —
-           искусственных событий не создаётся.
+           исходного уровня. Если событий меньше ``min_events`` или
+           чистых трасс уровня меньше двух, ядро нулевое (признак всегда
+           0) и выдаётся предупреждение — искусственных событий не
+           создаётся.
         """
         x_all, y_all = data["iq"], data["labels"]
         levels, fc = config["levels"], config["filter_config"]
@@ -837,8 +838,9 @@ class NeuralService:
                         kernel = self._matched_kernel(ev_mean - cl_mean, ev_vi + cl_vi, ev_vq + cl_vq, reg)
                     else:
                         filters["warnings"].append(
-                            f"{kind} атом {config['atoms'][a]}, {source}→{target}: найдено {len(event_sel)} трасс-событий "
-                            f"(нужно ≥ {fc['min_events']}); фильтр не откалиброван, его признак равен 0.")
+                            f"{kind} атом {config['atoms'][a]}, {source}→{target}: трасс-событий "
+                            f"{len(event_sel)} (нужно ≥ {fc['min_events']}), чистых трасс уровня "
+                            f"{len(clean_sel)} (нужно ≥ 2); фильтр не откалиброван, его признак равен 0.")
                     self._add_kernel(filters, a, kernel, kind, source, target, available, int(len(event_sel)))
         if config["mode"] == "matched" and not any(d["available"] for d in filters["descriptions"]):
             raise ValueError("Не удалось откалибровать ни одного фильтра. Включите QMF или добавьте данные.")
