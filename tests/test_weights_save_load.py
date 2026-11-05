@@ -24,11 +24,18 @@ from mainwindow import MainWindow
 
 
 class SaveWeightsTests(unittest.TestCase):
-    def test_save_weights_starts_only_background_save(self):
+    def test_save_weights_asks_for_name_and_saves_once(self):
         calls = []
+
+        class FakeService:
+            is_fitted = True
 
         state = SimpleNamespace(
             _busy=False,
+            service=FakeService(),
+            _require_project=lambda: None,
+            _guard=lambda function: function(),
+            _ask_weights_path=lambda: Path("/tmp/project/weights/model.pt"),
             _save_project_async=lambda **kwargs: calls.append(("async", kwargs)),
             _export_weights_now=lambda *args: calls.append(("export_now", ())),
             _save_project_now=lambda *args: calls.append(("save_now", ())),
@@ -38,7 +45,30 @@ class SaveWeightsTests(unittest.TestCase):
         MainWindow.save_weights(state)
 
         self.assertEqual([call[0] for call in calls], ["async"])
-        self.assertEqual(calls[0][1], {"force_weights": True})
+        self.assertEqual(calls[0][1], {
+            "force_weights": True,
+            "weights_path": Path("/tmp/project/weights/model.pt"),
+        })
+
+    def test_save_weights_without_name_does_nothing(self):
+        calls = []
+
+        class FakeService:
+            is_fitted = True
+
+        state = SimpleNamespace(
+            _busy=False,
+            service=FakeService(),
+            _require_project=lambda: None,
+            _guard=lambda function: function(),
+            _ask_weights_path=lambda: None,
+            _save_project_async=lambda **kwargs: calls.append(("async", kwargs)),
+            _error=lambda message: calls.append(("error", message)),
+        )
+
+        MainWindow.save_weights(state)
+
+        self.assertEqual(calls, [])
 
     def test_save_weights_reports_busy_state(self):
         calls = []

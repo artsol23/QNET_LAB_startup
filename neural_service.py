@@ -1111,6 +1111,24 @@ class NeuralService:
     # ------------------------------------------------------------------
     # Сеть
     # ------------------------------------------------------------------
+    @staticmethod
+    def auto_hidden_layers(config, feature_count: int) -> list[int]:
+        """Скрытые слои по умолчанию: ⌊P/2⌋, ⌊P/4⌋ с нижними границами.
+
+        Для сетей на каждый атом — не уже [2k+2, k+1], для общей сети —
+        не уже [4·Σk, 2·Σk], иначе узкое горлышко не вместит все выходы.
+
+        :param config: конфигурация (см. :meth:`configure`).
+        :param feature_count: P — число входов сети.
+        """
+        if config["per_atom_networks"]:
+            k_max = max(config["levels"])
+            return [max(feature_count // 2, 2 * k_max + 2),
+                    max(feature_count // 4, k_max + 1)]
+        outputs = sum(config["levels"])
+        return [max(feature_count // 2, 4 * outputs),
+                max(feature_count // 4, 2 * outputs)]
+
     def _build_model(self, config, feature_count) -> nn.Module:
         """Создать FNN по конфигурации; P = feature_count входов.
 
@@ -1123,15 +1141,8 @@ class NeuralService:
         """
         hidden = config["hidden_layers"]
         if hidden is None:
-            if config["per_atom_networks"]:
-                # Как в статье, но не уже 2k+2 и k+1 нейронов (k — уровней атома):
-                # при малом P (один кубит, P = 3) слои ⌊P/2⌋, ⌊P/4⌋ = 1, 0 вырождаются.
-                k_max = max(config["levels"])
-                hidden = [max(feature_count // 2, 2 * k_max + 2), max(feature_count // 4, k_max + 1)]
-            else:
-                # Общей сети нужен запас: выходов Σk, а не k одного атома.
-                outputs = sum(config["levels"])
-                hidden = [max(feature_count // 2, 4 * outputs), max(feature_count // 4, 2 * outputs)]
+            # Как в статье: [⌊P/2⌋, ⌊P/4⌋] с нижними границами.
+            hidden = self.auto_hidden_layers(config, feature_count)
         act = self.ACTIVATIONS[config["activation"]]
 
         def mlp(out_size):

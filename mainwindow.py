@@ -86,6 +86,31 @@ from training_history import HISTORY_KEYS, clean_history, read_history
 from result_export import write_predictions_csv, write_report_json
 
 
+class NoWheelSpinBox(QSpinBox):
+    """Поле, значение которого не меняется колесом мыши.
+
+    Колесо над полем часто прокручивает страницу или меняет число
+    не там, где пользователь хотел; значение меняется только вводом.
+    """
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """То же для полей с дробными числами."""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class NoWheelSlider(QSlider):
+    """Ползунок, значение которого не меняется колесом мыши."""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 class MainWindow(QMainWindow):
     """Главное окно: проект, два режима (обучение / валидация), графики."""
 
@@ -236,6 +261,18 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._validation_page())
         root.addWidget(self.pages, 1)
 
+        # Автоматические размеры слоёв пересчитываются, когда меняются
+        # параметры сети или загружаются данные.
+        self.model_combo.currentIndexChanged.connect(self._refresh_auto_layers)
+        self.per_atom_check.toggled.connect(self._refresh_auto_layers)
+        self.atoms_edit.textChanged.connect(self._refresh_auto_layers)
+        self.levels_edit.textChanged.connect(self._refresh_auto_layers)
+        self.qmf_check.toggled.connect(self._refresh_auto_layers)
+        self.rmf_check.toggled.connect(self._refresh_auto_layers)
+        self.emf_check.toggled.connect(self._refresh_auto_layers)
+        self.window_start.valueChanged.connect(self._refresh_auto_layers)
+        self.window_stop.valueChanged.connect(self._refresh_auto_layers)
+
         bottom = QHBoxLayout()
         self.status = QLabel("Создайте или откройте проект.")
         bottom.addWidget(self.status, 1)
@@ -300,7 +337,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _spin(low, high, value, step=1) -> QSpinBox:
-        box = QSpinBox()
+        box = NoWheelSpinBox()
         box.setRange(low, high)
         box.setValue(value)
         box.setSingleStep(step)
@@ -308,7 +345,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _dspin(low, high, value, step, decimals) -> QDoubleSpinBox:
-        box = QDoubleSpinBox()
+        box = NoWheelDoubleSpinBox()
         box.setDecimals(decimals)
         box.setRange(low, high)
         box.setSingleStep(step)
@@ -317,7 +354,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _slider(low, high, value) -> QSlider:
-        slider = QSlider(Qt.Orientation.Horizontal)
+        slider = NoWheelSlider(Qt.Orientation.Horizontal)
         slider.setRange(low, high)
         slider.setValue(value)
         return slider
@@ -1070,7 +1107,7 @@ class MainWindow(QMainWindow):
         self._write_json(self._manifest_path(), self.manifest)
         self._set_dirty(False)
 
-    def _save_project_async(self, *, force_weights=False, on_success=None):
+    def _save_project_async(self, *, force_weights=False, on_success=None, weights_path=None):
         """Сохранить проект в рабочем потоке.
 
         force_weights=True:
@@ -1079,6 +1116,10 @@ class MainWindow(QMainWindow):
         force_weights=False:
             создать файл весов, если модель изменена
             или ещё не имеет сохранённого файла.
+
+        weights_path:
+            путь для нового файла весов (имя выбрал пользователь);
+            None — имя подбирается автоматически.
         """
         if self._busy:
             return
@@ -1109,16 +1150,21 @@ class MainWindow(QMainWindow):
             manifest_name = self.manifest_name
             store = ProjectStore(project_dir)
 
-            weights_path = None
+            weights_target = None
             weights_entry = None
             metadata = None
 
             if save_weights:
-                weights_path = store.unique_path(
-                    "weights",
-                    "weights",
-                    ".pt",
-                )
+                if weights_path is not None:
+                    # Имя файла выбрал пользователь.
+                    weights_target = Path(weights_path)
+                    weights_target.parent.mkdir(parents=True, exist_ok=True)
+                else:
+                    weights_target = store.unique_path(
+                        "weights",
+                        "weights",
+                        ".pt",
+                    )
 
                 last_metrics = (
                     copy.deepcopy(self.history[-1])
@@ -1148,7 +1194,7 @@ class MainWindow(QMainWindow):
                 }
 
                 weights_entry = store.jsonable({
-                    "file": store.relative_path(weights_path),
+                    "file": store.relative_path(weights_target),
                     **metadata,
                     "config": copy.deepcopy(service.config),
                 })
@@ -1159,7 +1205,7 @@ class MainWindow(QMainWindow):
                 "project_dir": project_dir,
                 "manifest_name": manifest_name,
                 "manifest": manifest,
-                "weights_path": weights_path,
+                "weights_path": weights_target,
                 "weights_entry": weights_entry,
                 "metadata": metadata,
             }
@@ -1396,6 +1442,7 @@ class MainWindow(QMainWindow):
             self.result_metadata = None
             self.eval_info.setText(self._describe_data(data, "eval"))
         self._refresh_atoms()
+        self._refresh_auto_layers()
         self.manifest = self._manifest_now()
         self._write_json(self._manifest_path(), self.manifest)
         self._log(f"Загружены данные ({role}): {entry['original']} — {self._describe_data(data, role)}")
@@ -1576,8 +1623,90 @@ class MainWindow(QMainWindow):
     # Конфигурация из формы
     # ------------------------------------------------------------------
     def _auto_layers_toggled(self, auto: bool):
+        """Галочка «скрытые слои автоматически»: поля показывают ⌊P/2⌋, ⌊P/4⌋."""
+        self._set_auto_layers(auto)
+
+    def _set_auto_layers(self, auto: bool):
+        """Включить или выключить автоматический выбор размеров слоёв.
+
+        При включении поля показывают те размеры, которые сеть получит
+        при обучении: ⌊P/2⌋ и ⌊P/4⌋ (с нижними границами). Раньше после
+        возврата галочки в поле оставались старые ручные значения.
+        """
         for widget in (self.layers_slider, self.width_slider, self.hidden_edit):
             widget.setEnabled(not auto)
+        if not auto:
+            return
+        sizes = self._auto_layer_sizes()
+        if not sizes:
+            return
+        self.layers_slider.setValue(min(len(sizes), self.layers_slider.maximum()))
+        self.width_slider.setValue(max(self.width_slider.minimum(),
+                                       min(sizes[0], self.width_slider.maximum())))
+        # Слайдеры заполняют поле по своему правилу (каждый следующий вдвое
+        # меньше) — показываем точные автоматические размеры.
+        self.layers_label.setText(str(len(sizes)))
+        self.width_label.setText(str(sizes[0]))
+        self.hidden_edit.setText(", ".join(str(value) for value in sizes))
+
+    def _refresh_auto_layers(self):
+        """Обновить показ автоматических размеров, если они включены."""
+        if self.auto_layers.isChecked():
+            self._set_auto_layers(True)
+
+    def _auto_config(self) -> dict | None:
+        """Параметры сети из формы — без обращения к сервису."""
+        if not hasattr(self, "window_start"):
+            return None      # форма ещё собирается
+        try:
+            atoms = self._ints(self.atoms_edit.text(), "Атомы")
+            levels = self._ints(self.levels_edit.text(), "Уровни")
+            filters = self._filter_config()
+        except ValueError:
+            return None
+        if len(levels) == 1 and len(atoms) > 1:
+            levels = levels * len(atoms)
+        if not atoms or len(atoms) != len(levels):
+            return None
+        return dict(atoms=atoms, levels=levels,
+                    mode=self.model_combo.currentData(),
+                    per_atom_networks=self.per_atom_check.isChecked(),
+                    filter_config=filters)
+
+    def _input_features(self, config: dict) -> int:
+        """Число входов сети (P) для параметров из формы."""
+        if config["mode"] == "raw":
+            window = config["filter_config"].get("window")
+            length = self._samples()
+            if window is not None:
+                length = max(int(window[1]) - int(window[0]), 0)
+            return 2 * len(config["atoms"]) * max(length, 0)
+        filters = config["filter_config"]
+        kinds = sum(1 for flag in ("qmf", "rmf", "emf") if filters[flag])
+        if not kinds:
+            return 0
+        # По одному фильтру на каждую пару уровней и каждый вид фильтра.
+        return sum(k * (k - 1) // 2 for k in config["levels"]) * kinds
+
+    def _auto_layer_sizes(self) -> list[int]:
+        """Размеры скрытых слоёв при автоматическом выборе: ⌊P/2⌋, ⌊P/4⌋."""
+        config = self._auto_config()
+        if config is None:
+            return []
+        service_config = self.service.config or {}
+        if (self.service.is_fitted
+                and service_config.get("hidden_layers") is None
+                and service_config.get("atoms") == config["atoms"]
+                and service_config.get("levels") == config["levels"]
+                and service_config.get("mode") == config["mode"]
+                and service_config.get("per_atom_networks") == config["per_atom_networks"]):
+            hidden = self.service.describe().get("hidden")
+            if hidden:
+                return list(hidden)
+        features = self._input_features(config)
+        if features <= 0:
+            return []
+        return NeuralService.auto_hidden_layers(config, features)
 
     def _layers_from_sliders(self):
         """Слайдеры «число слоёв» и «размер первого слоя» → размеры, каждый следующий вдвое меньше."""
@@ -1647,6 +1776,7 @@ class MainWindow(QMainWindow):
         self.margin_spin.setValue(fc["event_margin"])
         self.reg_spin.setValue(fc["regularization"])
         self.min_events_spin.setValue(fc["min_events"])
+        self._refresh_auto_layers()
 
     def _on_lr_slider(self, value: int) -> None:
         """Learning rate по положению ползунка (логарифмическая шкала)."""
@@ -2127,6 +2257,7 @@ class MainWindow(QMainWindow):
     def save_weights(self):
         """Сохранить новый набор весов и обновить проект.
 
+        Имя файла выбирается в диалоге; веса остаются в папке проекта.
         Сохранение выполняется только в рабочем потоке. Раньше здесь
         дополнительно запускался синхронный экспорт в главном потоке:
         два экспорта писали один и тот же файл весов и один и тот же
@@ -2135,7 +2266,40 @@ class MainWindow(QMainWindow):
         if self._busy:
             self._error("Дождитесь завершения текущей операции.")
             return
-        self._save_project_async(force_weights=True)
+        if not self._guard(lambda: self._require_project() or True):
+            return
+        if not self.service.is_fitted:
+            self._error("Нет обученной модели для сохранения.")
+            return
+        path = self._ask_weights_path()
+        if path is None:
+            return
+        self._save_project_async(force_weights=True, weights_path=path)
+
+    def _ask_weights_path(self) -> Path | None:
+        """Спросить имя файла весов; None — пользователь отказался."""
+        folder = self.project_dir / "weights"
+        folder.mkdir(parents=True, exist_ok=True)
+        suggested = self._unique("weights", "weights", ".pt").name
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить набор весов",
+            str(folder / suggested),
+            "Веса Q-Net Lab (*.pt)",
+        )
+        if not selected:
+            return None
+        path = Path(selected).resolve()
+        if path.suffix.lower() != ".pt":
+            path = (path.with_suffix(".pt") if path.suffix
+                    else path.with_name(path.name + ".pt"))
+        try:
+            self._relative(path)
+        except ValueError:
+            self._error("Файл весов должен лежать в папке проекта: "
+                        "все файлы проекта хранятся в ней.")
+            return None
+        return path
 
     def _refresh_weights_list(self):
         self.weights_list.clear()
