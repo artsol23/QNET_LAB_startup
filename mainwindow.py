@@ -111,6 +111,13 @@ class NoWheelSlider(QSlider):
         event.ignore()
 
 
+class NoWheelComboBox(QComboBox):
+    """Выпадающий список, который не переключается колесом мыши."""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 class MainWindow(QMainWindow):
     """Главное окно: проект, два режима (обучение / валидация), графики."""
 
@@ -234,7 +241,7 @@ class MainWindow(QMainWindow):
 
         device_layout.addWidget(QLabel("Вычисления:"))
 
-        self.device_combo = QComboBox()
+        self.device_combo = NoWheelComboBox()
         self.device_combo.addItem("Автоматически", "auto")
         self.device_combo.addItem("CPU", "cpu")
         self.device_combo.addItem("GPU NVIDIA", "cuda:0")
@@ -272,6 +279,10 @@ class MainWindow(QMainWindow):
         self.emf_check.toggled.connect(self._refresh_auto_layers)
         self.window_start.valueChanged.connect(self._refresh_auto_layers)
         self.window_stop.valueChanged.connect(self._refresh_auto_layers)
+
+        # Начальные размеры автоматических слоёв: к этому моменту созданы
+        # и фильтры, и остальные поля, поэтому их можно посчитать.
+        self._set_auto_layers(self.auto_layers.isChecked())
 
         bottom = QHBoxLayout()
         self.status = QLabel("Создайте или откройте проект.")
@@ -397,7 +408,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(toggles)
         single = QHBoxLayout()
         single.addWidget(QLabel("Оставить один:"))
-        self.single_combo = QComboBox()
+        self.single_combo = NoWheelComboBox()
         for key, (title, *_) in self.TRAIN_CHARTS.items():
             self.single_combo.addItem(title, key)
         single.addWidget(self.single_combo)
@@ -469,7 +480,7 @@ class MainWindow(QMainWindow):
         self.levels_edit.setToolTip("Число уровней каждого выбранного атома; одно число — для всех")
         form.addRow("Атомы (каналы)", self.atoms_edit)
         form.addRow("Уровни атомов", self.levels_edit)
-        self.model_combo = QComboBox()
+        self.model_combo = NoWheelComboBox()
         self.model_combo.addItem("Фильтры QMF/RMF/EMF + FNN (статья)", "matched")
         self.model_combo.addItem("FNN по временным I/Q", "raw")
         form.addRow("Модель", self.model_combo)
@@ -497,7 +508,7 @@ class MainWindow(QMainWindow):
         form.addRow("Размеры слоёв", self.hidden_edit)
         self.layers_slider.valueChanged.connect(self._layers_from_sliders)
         self.width_slider.valueChanged.connect(self._layers_from_sliders)
-        self.activation_combo = QComboBox()
+        self.activation_combo = NoWheelComboBox()
         self.activation_combo.addItems(list(NeuralService.ACTIVATIONS))
         form.addRow("Активация", self.activation_combo)
         self.dropout_slider = self._slider(0, 80, 0)
@@ -521,7 +532,7 @@ class MainWindow(QMainWindow):
         row.addWidget(QLabel("…"))
         row.addWidget(self.window_stop)
         form.addRow("Окно, отсчёты", row)
-        self.conv_combo = QComboBox()
+        self.conv_combo = NoWheelComboBox()
         for text, key in (("нет", "none"), ("прямоугольное (boxcar)", "boxcar"), ("гауссово", "gauss"),
                           ("экспоненциальное", "exp"), ("своё ядро", "custom")):
             self.conv_combo.addItem(text, key)
@@ -542,7 +553,7 @@ class MainWindow(QMainWindow):
         for check in (self.qmf_check, self.rmf_check, self.emf_check):
             check.setChecked(True)
             form.addRow(check)
-        self.event_combo = QComboBox()
+        self.event_combo = NoWheelComboBox()
         self.event_combo.addItem("ближайший центроид MTV (статья)", "centroid")
         self.event_combo.addItem("ранний/поздний сегмент", "segments")
         form.addRow("Поиск трасс-событий", self.event_combo)
@@ -558,7 +569,7 @@ class MainWindow(QMainWindow):
         # 4. Оптимизатор и запуск
         box = QGroupBox("4. Оптимизатор и обучение")
         form = QFormLayout(box)
-        self.optimizer_combo = QComboBox()
+        self.optimizer_combo = NoWheelComboBox()
         self.optimizer_combo.addItems(list(NeuralService.OPTIMIZERS))
         form.addRow("Оптимизатор", self.optimizer_combo)
         self.lr_slider = self._slider(-60, -10, -25)
@@ -644,16 +655,16 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(10, 0, 0, 0)
         row = QHBoxLayout()
         row.addWidget(QLabel("График:"))
-        self.view_combo = QComboBox()
+        self.view_combo = NoWheelComboBox()
         self.view_combo.addItems(self.VALIDATION_VIEWS)
         self.view_combo.currentIndexChanged.connect(self._schedule_redraw)
         row.addWidget(self.view_combo)
-        self.color_combo = QComboBox()
+        self.color_combo = NoWheelComboBox()
         self.color_combo.addItem("цвет: предсказание", "prediction")
         self.color_combo.addItem("цвет: метка", "label")
         self.color_combo.currentIndexChanged.connect(self._schedule_redraw)
         row.addWidget(self.color_combo)
-        self.filter_combo = QComboBox()
+        self.filter_combo = NoWheelComboBox()
         self.filter_combo.setToolTip("Какой фильтр показывать на гистограммах")
         self.filter_combo.currentIndexChanged.connect(self._schedule_redraw)
         row.addWidget(self.filter_combo)
@@ -1666,8 +1677,11 @@ class MainWindow(QMainWindow):
             return None
         if len(levels) == 1 and len(atoms) > 1:
             levels = levels * len(atoms)
-        if not atoms or len(atoms) != len(levels):
+        if not atoms or not levels:
             return None
+        # Число уровней может на пару отличаться от числа атомов: пока
+        # пользователь правит поля, показываем размеры по введённым
+        # уровням — пересчёт не должен ждать, пока поля станут согласованы.
         return dict(atoms=atoms, levels=levels,
                     mode=self.model_combo.currentData(),
                     per_atom_networks=self.per_atom_check.isChecked(),

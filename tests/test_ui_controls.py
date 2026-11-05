@@ -23,6 +23,7 @@ preload_system_icu()
 
 from mainwindow import (  # noqa: E402
     MainWindow,
+    NoWheelComboBox,
     NoWheelDoubleSpinBox,
     NoWheelSlider,
     NoWheelSpinBox,
@@ -71,6 +72,17 @@ class WheelTests(unittest.TestCase):
         self.assertIsInstance(MainWindow._spin(0, 1, 0), NoWheelSpinBox)
         self.assertIsInstance(MainWindow._dspin(0, 1, 0, 0.1, 2), NoWheelDoubleSpinBox)
         self.assertIsInstance(MainWindow._slider(0, 1, 0), NoWheelSlider)
+
+    def test_combo_box_keeps_value(self):
+        combo = NoWheelComboBox()
+        combo.addItems(["первый", "второй", "третий"])
+        combo.setCurrentIndex(0)
+        combo.setFocus()
+
+        send_wheel(combo)
+
+        self.assertEqual(combo.currentIndex(), 0)
+        self.assertEqual(combo.currentText(), "первый")
 
 
 class FakeValue:
@@ -172,6 +184,28 @@ class AutoHiddenRuleTests(unittest.TestCase):
     def test_rule_without_limits(self):
         config = {"per_atom_networks": True, "levels": [2]}
         self.assertEqual(NeuralService.auto_hidden_layers(config, 64), [32, 16])
+
+
+class InputFeaturesTests(unittest.TestCase):
+    """Число входов сети (P) по параметрам формы."""
+
+    def test_matched_features_from_levels(self):
+        config = dict(mode="matched", atoms=[0, 1, 2], levels=[2, 3],
+                      filter_config=dict(qmf=True, rmf=True, emf=True, window=None))
+        # По одной паре уровней на атом: C(2,2) + C(3,2) = 4, по три фильтра.
+        self.assertEqual(MainWindow._input_features(None, config), 12)
+
+    def test_raw_features_from_atoms_and_samples(self):
+        config = dict(mode="raw", atoms=[0, 1, 2], levels=[2, 2, 2],
+                      filter_config=dict(window=None))
+        state = SimpleNamespace(_samples=lambda: 100)
+        self.assertEqual(MainWindow._input_features(state, config), 600)
+
+    def test_raw_features_with_window(self):
+        config = dict(mode="raw", atoms=[0, 1], levels=[2, 2],
+                      filter_config=dict(window=[10, 60]))
+        state = SimpleNamespace(_samples=lambda: 100)
+        self.assertEqual(MainWindow._input_features(state, config), 200)
 
 
 if __name__ == "__main__":
