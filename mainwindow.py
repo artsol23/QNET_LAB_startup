@@ -40,7 +40,7 @@ macro-F1, XEB, матрица ошибок). Каждый график вклю�
 данных, применение фильтров модели, гистограммы выходов фильтров) и
 «Распознавание» (валидация по меткам, классификация без меток, экспорт).
 Справа — графики эффективности классификатора: пятна IQ, матрицы ошибок,
-бенчмарки (NN против центроида/LDA/QDA), ошибки распада и «температуры»,
+бенчмарки (NN против центроида/LDA/QDA), ошибки распада и возбуждения,
 гистограммы и ядра фильтров, кривые IQ. Одновременно показывается не более
 пяти атомов — пользователь сам отмечает, какие.
 
@@ -135,7 +135,7 @@ class MainWindow(QMainWindow):
         "confusion": ("Матрица ошибок (validation)", None, None),
     }
     HISTORY_KEYS = HISTORY_KEYS
-    VALIDATION_VIEWS = ("Пятна IQ", "Матрицы ошибок", "Бенчмарки", "Распад и температура",
+    VALIDATION_VIEWS = ("Пятна IQ", "Матрицы ошибок", "Бенчмарки", "Распад и возбуждение",
                         "Гистограммы фильтров", "Ядра фильтров", "Кривые IQ")
 
     # ==================================================================
@@ -162,7 +162,6 @@ class MainWindow(QMainWindow):
         self.result_metadata: dict | None = None
         self.result_source = ""                   # описание набора для отчётов
         self.diagnostics: dict | None = None      # filter_diagnostics()
-        self.leakage: dict | None = None          # предложение find_leakage()
         self.current_weights: str | None = None   # имя файла весов в проекте
         self.model_fingerprint: str | None = None  # отпечаток train, на котором обучены текущие веса
         self.dirty = False                        # есть несохранённые изменения модели
@@ -460,15 +459,6 @@ class MainWindow(QMainWindow):
         self.split_info = QLabel("Разделение не выполнено")
         self.split_info.setWordWrap(True)
         form.addRow(self.split_info)
-        leak_row = QHBoxLayout()
-        self.leak_atom = self._spin(0, 255, 0)
-        leak_row.addWidget(QLabel("Атом"))
-        leak_row.addWidget(self.leak_atom)
-        leak_button = QPushButton("Поиск утечки в |2⟩ (спектр. кластеризация)")
-        leak_button.setToolTip("§V-A статьи: найти естественную утечку по MTV и предложить метки уровня 2")
-        leak_button.clicked.connect(self.find_leakage)
-        leak_row.addWidget(leak_button)
-        form.addRow(leak_row)
         layout.addWidget(box)
 
         # 2. Архитектура
@@ -744,10 +734,6 @@ class MainWindow(QMainWindow):
         classify = QPushButton("Классифицировать новые данные")
         classify.clicked.connect(self.classify_external)
         form.addRow(classify)
-        self.f01_edit = QLineEdit()
-        self.f01_edit.setPlaceholderText("напр. 5.1, 4.9 (ГГц) — для T_eff")
-        self.f01_edit.setToolTip("Частоты переходов 0→1 атомов; без них температура не оценивается")
-        form.addRow("f01 атомов, ГГц", self.f01_edit)
         layout.addWidget(box)
         box = QGroupBox("Экспорт в папку проекта")
         form = QVBoxLayout(box)
@@ -1061,7 +1047,7 @@ class MainWindow(QMainWindow):
     def _reset_state(self):
         self.train_data = self.eval_data = self.split = None
         self.manifest_name = "project.json"
-        self.history, self.train_eval, self.result, self.diagnostics, self.leakage = [], None, None, None, None
+        self.history, self.train_eval, self.result, self.diagnostics = [], None, None, None
         self._train_rollback = None
         self.current_weights = None
         self.model_fingerprint = None
@@ -1443,7 +1429,7 @@ class MainWindow(QMainWindow):
         role, data, entry = payload
         self.manifest.setdefault("datasets", {})[role] = entry
         if role == "train":
-            self.train_data, self.split, self.leakage = data, None, None
+            self.train_data, self.split = data, None
             self.split_info.setText("Новые данные: выполните разделение.")
             self.train_info.setText(self._describe_data(data, "train"))
             n_atoms = data["iq"].shape[1]
@@ -1553,7 +1539,7 @@ class MainWindow(QMainWindow):
         # Фактический SHA прочитанного файла (если файл менялся после импорта —
         # именно его содержимое), а не только SHA, записанный при импорте.
         digest.update(str(entry.get("actual_sha256") or entry.get("sha256")).encode())
-        # Содержимое меток train (в т.ч. псевдометок утечки), а не только имя файла.
+        # Содержимое меток train, а не только имя файла.
         digest.update(np.ascontiguousarray(self.train_data["labels"][self.split["train"]]).tobytes())
         digest.update(np.asarray(self.split["train"], np.int64).tobytes())
         return digest.hexdigest()
@@ -1567,72 +1553,6 @@ class MainWindow(QMainWindow):
         joined = np.concatenate([self.split[k] for k in ("train", "validation", "test")])
         if len(np.unique(joined)) != len(joined) or joined.min() < 0 or joined.max() >= n:
             raise ValueError("Разделение в проекте повреждено — выполните его заново.")
-
-    def find_leakage(self):
-        """§V-A статьи: предложить метки утечки в |2⟩ для атома и спросить пользователя."""
-        if self._busy:
-            return
-
-        atom, seed = self.leak_atom.value(), self.seed_spin.value()   # виджеты читаются в главном потоке
-
-        def work():
-            if self.train_data is None or self.split is None:
-                raise ValueError("Загрузите обучающие данные с метками и выполните разделение.")
-            # Кластеры подбираются ТОЛЬКО по train (по подготовленным меткам, если
-            # разметка уже применялась). Validation и test размечаются по найденным
-            # центрам без повторного подбора — они не участвуют в предобработке.
-            data = dict(self.train_data)
-            if data.get("prepared_labels") is not None:
-                data["labels"] = data["prepared_labels"]
-            proposal = self.service.find_leakage(data, atom, indices=self.split["train"], seed=seed)
-            proposal["other_indices"] = np.concatenate([self.split["validation"], self.split["test"]])
-            proposal["other_labels"] = self.service.leakage_labels(data, proposal, proposal["other_indices"])
-            return proposal
-        self._run("Поиск утечки (спектральная кластеризация)", work, self._leakage_found)
-
-    def _leakage_found(self, result: dict):
-        self.leakage = result
-        atom = result["atom"]
-        self.view_combo.setCurrentText("Пятна IQ")
-        self._draw_leakage(result, atom)
-        text = (f"Атом {atom}: размеры кластеров {result['cluster_sizes']}; сопоставление кластер→уровень "
-                f"{result['mapping']}; кандидатов утечки в |{result['leaked_level']}⟩: {result['leaked_count']}; "
-                f"согласие остальных кластеров с подготовкой: {self._pct(result['agreement'])}.")
-        if result["warnings"]:
-            text += "\n\nПРЕДУПРЕЖДЕНИЯ: " + " ".join(result["warnings"])
-        self._log(text)
-        answer = QMessageBox.question(
-            self, "Поиск утечки",
-            text + "\n\nЭто гипотеза по кластерам MTV, а не измерение. Применить предложенные метки? "
-            "Кластеры ищутся только по train; validation и test размечаются по найденным центрам кластеров "
-            "без повторной кластеризации. Подготовленные метки сохраняются отдельно (для физической диагностики). Исправленные метки будут сохранены в папке проекта.")
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        if self.train_data.get("prepared_labels") is None:
-            self.train_data["prepared_labels"] = self.train_data["labels"]
-        labels = self.train_data["labels"].copy()
-        labels[result["indices"], atom] = result["labels"]
-        labels[result["other_indices"], atom] = result["other_labels"]
-        self.train_data["labels"] = labels
-        path = self._unique("data", "labels_leakage", ".npy")
-        np.save(path, labels)
-        self.manifest["datasets"]["train"]["labels_override"] = self._relative(path)
-        self.manifest = self._manifest_now()
-        self._write_json(self._manifest_path(), self.manifest)
-        self.train_info.setText(self._describe_data(self.train_data, "train"))
-        # Число уровней только растёт: явно заданное пользователем значение
-        # (например, 3 для кудита) не должно уменьшиться из-за меток утечки.
-        from_labels = [int(v) + 1 for v in labels.max(axis=0)]
-        try:
-            current = self._ints(self.levels_edit.text(), "Уровни")
-        except ValueError:
-            current = []
-        if len(current) != len(from_labels):
-            current = from_labels
-        levels = [max(a, b) for a, b in zip(current, from_labels)]
-        self.levels_edit.setText(", ".join(map(str, levels)))
-        self._log(f"Метки утечки применены (train, validation, test) и сохранены: {path.name}; "
-                  "подготовленные метки сохранены отдельно.")
 
     # ------------------------------------------------------------------
     # Конфигурация из формы
@@ -1878,7 +1798,7 @@ class MainWindow(QMainWindow):
                     epochs=self.epochs_spin.value(), batch=self.batch_spin.value(),
                     val_fraction=self.val_fraction.value(), test_fraction=self.test_fraction.value(),
                     seed=self.seed_spin.value(), charts=[k for k, c in self.chart_checks.items() if c.isChecked()],
-                    view=self.view_combo.currentText(), f01=self.f01_edit.text(),
+                    view=self.view_combo.currentText(),
                     mode="validation" if self.mode_button.isChecked() else "training",
                     model=self.model_combo.currentData(), per_atom=self.per_atom_check.isChecked(),
                     auto_layers=self.auto_layers.isChecked(), hidden=self.hidden_edit.text(),
@@ -1908,7 +1828,6 @@ class MainWindow(QMainWindow):
             for key, check in self.chart_checks.items():
                 check.setChecked(key in charts)
             self.view_combo.setCurrentText(s.get("view", self.VALIDATION_VIEWS[0]))
-            self.f01_edit.setText(s.get("f01", ""))
             if "model" in s:
                 self.model_combo.setCurrentIndex(max(0, self.model_combo.findData(s["model"])))
                 self.per_atom_check.setChecked(bool(s.get("per_atom", True)))
@@ -2115,7 +2034,6 @@ class MainWindow(QMainWindow):
         dataset_role,
         data,
         indices=None,
-        f01=None,
     ):
         """Запустить расчёт с фиксацией происхождения результата."""
         if self._busy:
@@ -2185,9 +2103,6 @@ class MainWindow(QMainWindow):
                 },
                 "dataset_role": dataset_role,
                 "selection": selection,
-                "evaluation_parameters": {
-                    "f01_ghz": copy.deepcopy(f01),
-                },
             }
 
         metadata = self._guard(prepare)
@@ -2241,7 +2156,6 @@ class MainWindow(QMainWindow):
             self._check_split()
 
             return {
-                "f01": self._f01(),
                 "fingerprint": self._train_fingerprint(),
             }
 
@@ -2267,20 +2181,17 @@ class MainWindow(QMainWindow):
         service = self.service
         data = self.train_data
         indices = self.split["test"].copy()
-        f01 = checked["f01"]
 
         self._run_evaluation(
             "Проверка на test",
             lambda: service.validate(
                 data,
                 indices,
-                f01_ghz=f01,
             ),
             source="отложенный test",
             dataset_role="train",
             data=data,
             indices=indices,
-            f01=f01,
         )
 
     # ------------------------------------------------------------------
@@ -2513,16 +2424,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Валидация, классификация, фильтры
     # ------------------------------------------------------------------
-    def _f01(self):
-        text = self.f01_edit.text().strip()
-        if not text:
-            return None
-        try:
-            values = [float(v) for v in text.replace(";", ",").split(",") if v.strip()]
-        except ValueError as exc:
-            raise ValueError("f01: числа в ГГц через запятую.") from exc
-        return values[0] if len(values) == 1 else values
-
     def _need_eval(self, labels=False):
         if not self.service.is_fitted:
             raise ValueError("Сначала обучите сеть или загрузите веса.")
@@ -2536,29 +2437,18 @@ class MainWindow(QMainWindow):
         if self._busy:
             return
 
-        def check():
-            self._need_eval(labels=True)
-            return {"f01": self._f01()}
-
-        checked = self._guard(check)
-
-        if checked is None:
+        if self._guard(lambda: self._need_eval(labels=True) or True) is None:
             return
 
         service = self.service
         data = self.eval_data
-        f01 = checked["f01"]
 
         self._run_evaluation(
             "Валидация",
-            lambda: service.validate(
-                data,
-                f01_ghz=f01,
-            ),
+            lambda: service.validate(data),
             source="экспериментальные данные",
             dataset_role="eval",
             data=data,
-            f01=f01,
         )
 
     def classify_external(self):
@@ -2616,11 +2506,6 @@ class MainWindow(QMainWindow):
             self.mode_button.setChecked(True)
             self.view_combo.setCurrentText("Гистограммы фильтров")
             lines = []
-            for atom, entry in result.items():
-                ef = entry.get("event_fraction")
-                if ef:
-                    lines.append(f"Атом {atom}: помечено как распад {self._pct(ef['relaxation'])}, "
-                                 f"как возбуждение {self._pct(ef['excitation'])} (правило {ef['rule']}).")
             self.details.setPlainText("\n".join(lines) or "Фильтры применены.")
             self._log("Фильтры применены к экспериментальным данным.")
         self._run("Применение фильтров", lambda: self.service.filter_diagnostics(data, atoms=atoms or None), done)
@@ -2645,25 +2530,17 @@ class MainWindow(QMainWindow):
     def _details_text(self, r: dict) -> str:
         lines = []
         for p in r.get("per_atom", []):
-            sep = ", ".join(f"{i}|{j}: SNR {s['snr']:.2f}" for s in p.get("separation", []) if s["snr"] is not None
-                            for i, j in [s["pair"]])
-            t = p.get("effective_temperature_mK")
             lines.append(f"Атом {p['atom']}: точность {self._pct(p['accuracy'])}, fidelity {self._pct(p['assignment_fidelity'])}; "
                          f"ошибка распада по уровням {[self._pct(v) for v in p['decay_error']]}; "
-                         f"возбуждения {[self._pct(v) for v in p['excitation_error']]}; "
-                         f"наблюдаемая доля |0⟩, рано попавших в облако выше (диагностика) "
-                         f"{self._pct(p.get('thermal_population'))}, за вычетом перекрытия облаков в том же окне "
-                         f"{self._pct(p.get('thermal_corrected'))}"
-                         + ("" if t is None else f", T_eff ≈ {t:.1f} мК (по наблюдаемой доле, без коррекции ошибок считывания)") + (f"; {sep}" if sep else ""))
+                         f"возбуждения {[self._pct(v) for v in p['excitation_error']]}")
         lines += [str(w) for w in r.get("warnings", [])]
         if r.get("excluded"):
             lines.append(f"Исключено измерений с уровнями выше заданных: {r['excluded']}.")
-        lines.append("Ошибки распада/возбуждения и доля ранних возбуждений включают ошибки подготовки (SPAM) и "
-                     "перекрытие облаков: без отдельной калибровки считывания они не разделяют термальную "
-                     "населённость и ошибки назначения: это диагностика, а не оценка сверху или снизу. T_eff — только при заданной f01. "
+        lines.append("Ошибки распада и возбуждения посчитаны по матрице ошибок: это доля измерений, "
+                     "отнесённых сетью к уровню ниже или выше подготовленного, вместе с ошибками "
+                     "подготовки (SPAM) и шумом считывания. "
                      "XEB по меткам — accuracy регистра с поправкой на угадывание (D·acc−1)/(D−1), а не "
-                     "независимая квантовая fidelity; linear XEB считается только при ideal_probs в данных. "
-                     "* На графике «Распад и температура» T_eff — по наблюдаемой доле, без коррекции ошибок считывания.")
+                     "независимая квантовая fidelity; linear XEB считается только при ideal_probs в данных.")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -2912,8 +2789,6 @@ class MainWindow(QMainWindow):
         if view == "Кривые IQ":
             return self._draw_traces(atoms)
         if self.result is None:
-            if view == "Пятна IQ" and self.leakage is not None:
-                return self._draw_leakage(self.leakage, self.leakage["atom"])
             self._message(fig, canvas, "Нажмите «Валидировать» или «Классифицировать» на вкладке «Распознавание».")
             return
         r = self.result
@@ -2922,7 +2797,7 @@ class MainWindow(QMainWindow):
         if not atoms:
             self._message(fig, canvas, "Выбранные атомы не используются моделью.")
             return
-        if view in ("Матрицы ошибок", "Бенчмарки", "Распад и температура") and "per_atom" not in r:
+        if view in ("Матрицы ошибок", "Бенчмарки", "Распад и возбуждение") and "per_atom" not in r:
             self._message(fig, canvas, "Для этого графика нужны данные с метками (валидация).")
             return
         fig.clear()
@@ -3032,17 +2907,6 @@ class MainWindow(QMainWindow):
             self.val_figure,
             atoms=atoms,
             data=data,
-        )
-        self.val_canvas.draw_idle()
-
-    def _draw_leakage(self, result, atom):
-        # Переключение режима — обязанность окна, не plotting.
-        self.mode_button.setChecked(True)
-
-        plotting.draw_leakage(
-            self.val_figure,
-            result=result,
-            atom=atom,
         )
         self.val_canvas.draw_idle()
 

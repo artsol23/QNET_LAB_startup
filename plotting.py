@@ -354,39 +354,27 @@ def draw_benchmarks(ax, entry: dict) -> None:
 
     ax.set_ylim(max(0.0, min(values) - 0.1), 1.02)
 
-    snr = ", ".join(
-        f"{item['pair'][0]}|{item['pair'][1]} {item['snr']:.1f}"
-        for item in entry["separation"]
-        if item["snr"] is not None
-    )
-
     ax.set_title(
-        f"Атом {entry['atom']}: точность\nSNR пятен: {snr}",
+        f"Атом {entry['atom']}: точность",
         fontsize=8,
     )
     ax.grid(alpha=0.2, axis="y")
 
 
 def draw_physics(ax, entry: dict) -> None:
-    """Отобразить уже рассчитанные физические оценки."""
+    """Ошибки распада и возбуждения по матрице ошибок."""
     count = len(entry["decay_error"])
     x = np.arange(count)
     width = 0.2
 
     series = (
-        ("распад (матрица)", entry["decay_error"], "#c43c3c"),
-        ("распад в окне", entry["transition_down"], "#ef8a8a"),
-        (
-            "возбуждение (матрица)",
-            entry["excitation_error"],
-            "#1f5bb4",
-        ),
-        ("возбуждение в окне", entry["transition_up"], "#8fb3e8"),
+        ("распад (по матрице)", entry["decay_error"], "#c43c3c"),
+        ("возбуждение (по матрице)", entry["excitation_error"], "#1f5bb4"),
     )
 
     for index, (label, values, color) in enumerate(series):
         ax.bar(
-            x + (index - 1.5) * width,
+            x + (index - 0.5) * width,
             [0 if value is None else value for value in values],
             width,
             label=label,
@@ -397,31 +385,7 @@ def draw_physics(ax, entry: dict) -> None:
     ax.set_xlabel("подготовленный уровень")
     ax.set_ylabel("вероятность")
     ax.set_title(f"Атом {entry['atom']}", fontsize=10)
-
-    population = entry["thermal_population"]
-    population_text = (
-        "н/д" if population is None else f"{100 * population:.2f}%"
-    )
-    note = f"|0⟩ рано выше: {population_text}"
-
-    temperature = entry.get("effective_temperature_mK")
-    if temperature is not None:
-        note += f"\nT_eff ≈ {temperature:.0f} мК*"
-
-    ax.text(
-        0.02,
-        0.97,
-        note,
-        transform=ax.transAxes,
-        va="top",
-        fontsize=7,
-        bbox=dict(
-            boxstyle="round",
-            fc="white",
-            ec="#c3cfdf",
-            alpha=0.9,
-        ),
-    )
+    ax.legend(fontsize=8, frameon=False)
     ax.grid(alpha=0.2, axis="y")
 
 def draw_kernels(
@@ -700,43 +664,3 @@ def draw_traces(
         ax.grid(alpha=0.2)
 
     finish_figure(figure)
-
-
-def draw_leakage(
-    figure,
-    *,
-    result,
-    atom,
-) -> None:
-    """Отобразить готовый результат поиска утечки."""
-    figure.clear()
-    ax = figure.add_subplot(111)
-
-    mtv = result["mtv"]
-    labels = result["labels"]
-
-    for level in np.unique(labels):
-        selected = labels == level
-
-        ax.scatter(
-            mtv[selected].real,
-            mtv[selected].imag,
-            s=6,
-            alpha=0.5,
-            label=f"предложено |{level}⟩ ({selected.sum()})",
-        )
-
-    ax.set(
-        xlabel="I (MTV)",
-        ylabel="Q (MTV)",
-        title=(
-            f"Атом {atom}: "
-            "спектральная кластеризация MTV (§V-A)"
-        ),
-    )
-
-    if len(labels):
-        ax.legend(fontsize=8)
-
-    ax.grid(alpha=0.2)
-    figure.tight_layout()

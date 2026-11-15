@@ -183,7 +183,6 @@ class ProjectStore:
                     "Файл исправленных меток не соответствует данным."
                 )
 
-            data["prepared_labels"] = data["labels"]
             data["labels"] = labels.astype(np.int64)
 
         return data

@@ -81,7 +81,6 @@ class ResultProvenanceTests(unittest.TestCase):
         state,
         *,
         indices=None,
-        f01=None,
     ):
         data = {
             "iq": np.zeros((4, 1, 3), dtype=np.complex64),
@@ -95,7 +94,6 @@ class ResultProvenanceTests(unittest.TestCase):
             dataset_role="eval",
             data=data,
             indices=indices,
-            f01=f01,
         )
 
     @staticmethod
@@ -105,19 +103,14 @@ class ResultProvenanceTests(unittest.TestCase):
 
     def test_metadata_is_independent_of_later_state_changes(self):
         state, pending, completed = self.make_window_state()
-        frequencies = [5.1]
 
-        self.start_evaluation(
-            state,
-            f01=frequencies,
-        )
+        self.start_evaluation(state)
 
         # Меняем исходные объекты после постановки задачи.
         state.current_weights = "weights/another_model.pt"
         state.service.description["epochs"] = 999
         state.service.description["config"]["levels"][0] = 3
         state.manifest["datasets"]["eval"]["sha256"] = "changed"
-        frequencies[0] = 9.9
 
         self.finish_evaluation(pending)
 
@@ -135,10 +128,6 @@ class ResultProvenanceTests(unittest.TestCase):
         self.assertEqual(
             metadata["data"]["eval"]["sha256"],
             "original-data-hash",
-        )
-        self.assertEqual(
-            metadata["evaluation_parameters"]["f01_ghz"],
-            [5.1],
         )
 
     def test_unsaved_model_has_no_weights_reference(self):

@@ -133,8 +133,8 @@ def write_report_json(
         "warnings": result.get("warnings"),
         "notes": (
             "score = доля измерений со всеми атомами верно; "
-            "F_nQ — геометрическое среднее assignment fidelity "
-            "атомов; физические оценки включают SPAM."
+            "F_nQ — геометрическое среднее assignment fidelity атомов; "
+            "ошибки распада и возбуждения посчитаны по матрице ошибок."
         ),
     }
 
