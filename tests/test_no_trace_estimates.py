@@ -11,6 +11,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 from PyQt6.QtWidgets import QApplication
@@ -126,6 +127,55 @@ class InterfaceTests(unittest.TestCase):
     def test_view_is_renamed(self):
         self.assertIn("Распад и возбуждение", MainWindow.VALIDATION_VIEWS)
         self.assertNotIn("Распад и температура", MainWindow.VALIDATION_VIEWS)
+
+
+class ValidateExternalTests(unittest.TestCase):
+    """Кнопка «Валидировать» должна запускать проверку."""
+
+    def make_state(self, *, need_eval=None):
+        calls = []
+        errors = []
+
+        class FakeService:
+            def validate(self, data, *args, **kwargs):
+                return {"accuracy": 1.0}
+
+        def guard(function):
+            try:
+                return function()
+            except Exception as exc:  # noqa: BLE001 — как в MainWindow._guard
+                errors.append(str(exc))
+                return None
+
+        state = SimpleNamespace(
+            _busy=False,
+            service=FakeService(),
+            eval_data={"iq": np.zeros((2, 1, 2), dtype=np.complex64)},
+            _need_eval=need_eval or (lambda labels=False: None),
+            _guard=guard,
+            _run_evaluation=lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+        return state, calls, errors
+
+    def test_validation_starts(self):
+        state, calls, errors = self.make_state()
+
+        MainWindow.validate_external(state)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0][0], "Валидация")
+
+    def test_validation_not_started_without_data(self):
+        def need_eval(labels=False):
+            raise ValueError("Загрузите экспериментальные данные на вкладке «Фильтры».")
+
+        state, calls, errors = self.make_state(need_eval=need_eval)
+
+        MainWindow.validate_external(state)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(len(errors), 1)
 
 
 if __name__ == "__main__":

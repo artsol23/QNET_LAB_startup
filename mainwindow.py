@@ -2513,12 +2513,7 @@ class MainWindow(QMainWindow):
         if self._busy:
             return
 
-        def check():
-            self._need_eval(labels=True)
-
-        checked = self._guard(check)
-
-        if checked is None:
+        if self._guard(lambda: self._need_eval(labels=True) or True) is None:
             return
 
         service = self.service
