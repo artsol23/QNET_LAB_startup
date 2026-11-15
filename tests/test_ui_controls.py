@@ -171,6 +171,79 @@ class AutoLayersTests(unittest.TestCase):
         self.assertEqual(window.hidden_edit.value(), "64, 32")
 
 
+class FakeEdit:
+    """Поле ввода текста."""
+
+    def __init__(self, text=""):
+        self._text = text
+
+    def text(self):
+        return self._text
+
+    def setText(self, text):
+        self._text = text
+
+
+class FakeLayersWindow:
+    """Минимальное состояние окна для размеров слоёв."""
+
+    _layers_from_sliders = MainWindow._layers_from_sliders
+    _layers_from_edit = MainWindow._layers_from_edit
+    _ints = staticmethod(MainWindow._ints)
+
+    def __init__(self, text="64, 32"):
+        self.layers_slider = FakeValue(2, 0, 8)
+        self.width_slider = FakeValue(64, 2, 1024)
+        self.layers_label = FakeLabel("2")
+        self.width_label = FakeLabel("64")
+        self.hidden_edit = FakeEdit(text)
+        self._layers_updating = False
+
+
+class LayersSyncTests(unittest.TestCase):
+    """Ручной ввод размеров слоёв и слайдеры показывают одно и то же."""
+
+    def test_manual_values_move_sliders(self):
+        window = FakeLayersWindow()
+        window.hidden_edit.setText("45, 22, 11")
+
+        MainWindow._layers_from_edit(window)
+
+        self.assertEqual(window.layers_slider.value(), 3)
+        self.assertEqual(window.width_slider.value(), 45)
+        self.assertEqual(window.layers_label.text(), "3")
+        self.assertEqual(window.width_label.text(), "45")
+        # Введённые значения не переписываются по правилу слайдера.
+        self.assertEqual(window.hidden_edit.text(), "45, 22, 11")
+
+    def test_single_value(self):
+        window = FakeLayersWindow()
+        window.hidden_edit.setText("64")
+
+        MainWindow._layers_from_edit(window)
+
+        self.assertEqual(window.layers_slider.value(), 1)
+        self.assertEqual(window.width_slider.value(), 64)
+
+    def test_invalid_text_keeps_sliders(self):
+        window = FakeLayersWindow("45, 22, 11")
+        MainWindow._layers_from_edit(window)
+
+        window.hidden_edit.setText("abc")
+        MainWindow._layers_from_edit(window)
+
+        self.assertEqual(window.layers_slider.value(), 3)
+        self.assertEqual(window.width_slider.value(), 45)
+
+    def test_sliders_fill_the_field(self):
+        window = FakeLayersWindow()
+
+        window.width_slider.setValue(128)
+        MainWindow._layers_from_sliders(window)
+
+        self.assertEqual(window.hidden_edit.text(), "128, 64")
+
+
 class AutoHiddenRuleTests(unittest.TestCase):
     def test_rule_for_separate_networks(self):
         config = {"per_atom_networks": True, "levels": [2, 3]}

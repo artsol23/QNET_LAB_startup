@@ -34,7 +34,7 @@ mainwindow.py — главное окно Q-Net Lab. В файле ровно о
 слайдеры) и «Дообучение» (реестр сохранённых весов, загрузка, дообучение).
 Справа — графики метрик обучения (loss, score/accuracy, assignment fidelity,
 macro-F1, XEB, матрица ошибок). Каждый график включается флажком; кнопка
-«Только этот» оставляет один выбранный.
+«Показать» оставляет один выбранный.
 
 **Режим «Валидация»**: слева вкладки «Фильтры» (загрузка экспериментальных
 данных, применение фильтров модели, гистограммы выходов фильтров) и
@@ -412,7 +412,7 @@ class MainWindow(QMainWindow):
         for key, (title, *_) in self.TRAIN_CHARTS.items():
             self.single_combo.addItem(title, key)
         single.addWidget(self.single_combo)
-        only = QPushButton("Только этот")
+        only = QPushButton("Показать")
         only.clicked.connect(self._only_one_chart)
         single.addWidget(only)
         show_all = QPushButton("Показать все")
@@ -504,10 +504,14 @@ class MainWindow(QMainWindow):
         row.addWidget(self.width_label)
         form.addRow("Размер первого слоя", row)
         self.hidden_edit = QLineEdit("64, 32")
-        self.hidden_edit.setToolTip("Точные размеры слоёв через запятую (слайдеры заполняют это поле)")
+        self.hidden_edit.setToolTip("Точные размеры слоёв через запятую; слайдеры показывают "
+                                    "число слоёв и размер первого")
         form.addRow("Размеры слоёв", self.hidden_edit)
+        # Защита от встречного обновления поля и слайдеров.
+        self._layers_updating = False
         self.layers_slider.valueChanged.connect(self._layers_from_sliders)
         self.width_slider.valueChanged.connect(self._layers_from_sliders)
+        self.hidden_edit.textChanged.connect(self._layers_from_edit)
         self.activation_combo = NoWheelComboBox()
         self.activation_combo.addItems(list(NeuralService.ACTIVATIONS))
         form.addRow("Активация", self.activation_combo)
@@ -1651,14 +1655,18 @@ class MainWindow(QMainWindow):
         sizes = self._auto_layer_sizes()
         if not sizes:
             return
-        self.layers_slider.setValue(min(len(sizes), self.layers_slider.maximum()))
-        self.width_slider.setValue(max(self.width_slider.minimum(),
-                                       min(sizes[0], self.width_slider.maximum())))
-        # Слайдеры заполняют поле по своему правилу (каждый следующий вдвое
-        # меньше) — показываем точные автоматические размеры.
-        self.layers_label.setText(str(len(sizes)))
-        self.width_label.setText(str(sizes[0]))
-        self.hidden_edit.setText(", ".join(str(value) for value in sizes))
+        self._layers_updating = True
+        try:
+            self.layers_slider.setValue(min(len(sizes), self.layers_slider.maximum()))
+            self.width_slider.setValue(max(self.width_slider.minimum(),
+                                           min(sizes[0], self.width_slider.maximum())))
+            # Слайдеры заполняют поле по своему правилу (каждый следующий
+            # вдвое меньше) — показываем точные автоматические размеры.
+            self.layers_label.setText(str(len(sizes)))
+            self.width_label.setText(str(sizes[0]))
+            self.hidden_edit.setText(", ".join(str(value) for value in sizes))
+        finally:
+            self._layers_updating = False
 
     def _refresh_auto_layers(self):
         """Обновить показ автоматических размеров, если они включены."""
@@ -1727,7 +1735,37 @@ class MainWindow(QMainWindow):
         count, width = self.layers_slider.value(), self.width_slider.value()
         self.layers_label.setText(str(count))
         self.width_label.setText(str(width))
-        self.hidden_edit.setText(", ".join(str(max(width >> i, 2)) for i in range(count)))
+        if self._layers_updating:
+            return
+        self._layers_updating = True
+        try:
+            self.hidden_edit.setText(", ".join(str(max(width >> i, 2)) for i in range(count)))
+        finally:
+            self._layers_updating = False
+
+    def _layers_from_edit(self):
+        """Ручной ввод размеров слоёв → слайдеры и подписи.
+
+        Пока пользователь печатает, текст может быть неполным или неверным —
+        тогда слайдеры не трогаем.
+        """
+        if self._layers_updating:
+            return
+        try:
+            values = self._ints(self.hidden_edit.text(), "Размеры слоёв")
+        except ValueError:
+            return
+        if not values:
+            return
+        self._layers_updating = True
+        try:
+            self.layers_slider.setValue(min(len(values), self.layers_slider.maximum()))
+            self.width_slider.setValue(max(self.width_slider.minimum(),
+                                           min(values[0], self.width_slider.maximum())))
+            self.layers_label.setText(str(len(values)))
+            self.width_label.setText(str(values[0]))
+        finally:
+            self._layers_updating = False
 
     @staticmethod
     def _ints(text: str, name: str) -> list[int]:
