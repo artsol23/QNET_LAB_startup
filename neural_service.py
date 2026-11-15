@@ -933,11 +933,10 @@ class NeuralService:
         """Данные для панели «Применение фильтров» режима валидации.
 
         Для выбранных атомов возвращает выходы их фильтров (гистограммы по
-        классам), ядра фильтров и долю трасс, которые правило событий
-        текущей модели пометило как распад или возбуждение.
+        классам) и ядра фильтров.
 
         :returns: ``{atom: {"names", "values" [M, F], "labels" [M] | None,
-            "kernels" [F, T'], "event_fraction": {...}}}`` — M ≤ max_points.
+            "kernels" [F, T'], "available"}}`` — M ≤ max_points.
         """
         self._require_fitted()
         data = self._check_compatible(data)
@@ -961,16 +960,6 @@ class NeuralService:
                 entry["available"] = [self.filters["descriptions"][j]["available"] for j in cols]
             else:
                 entry["names"], entry["values"], entry["kernels"], entry["available"] = [], None, None, []
-            if data["labels"] is not None:
-                ya = data["labels"][indices, channel]
-                ok = ya < self.config["levels"][a]
-                obs = self._event_labels(data["iq"], indices[ok], a, ya[ok], self.filters["centroids"][a],
-                                         self.filters["means"][a], self.config, batch_size)
-                entry["event_fraction"] = {
-                    "relaxation": float(np.mean(obs[obs >= 0] < ya[ok][obs >= 0])) if np.any(obs >= 0) else None,
-                    "excitation": float(np.mean(obs[obs >= 0] > ya[ok][obs >= 0])) if np.any(obs >= 0) else None,
-                    "rule": self.config["filter_config"]["event_rule"],
-                }
             result[channel] = entry
         return result
 
@@ -1627,15 +1616,15 @@ class NeuralService:
           ``xeb_labels``, ``xeb_linear``, ``benchmarks``;
         * ``per_atom`` — для каждого атома: матрица ошибок, fidelity, ошибки
           распада ``decay_error[i] = P(предсказан уровень < i | подготовлен i)``
-          и возбуждения ``excitation_error[i]``, бенчмарки, разделение пятен
-          (SNR и оценка ошибки перекрытия для каждой пары уровней), оценки
-          переходов и термальной населённости (см. :meth:`_physics`);
+          и возбуждения ``excitation_error[i]``, бенчмарки и, если задана
+          частота f01, оценка эффективной температуры
+          ``effective_temperature_mK`` (см. :meth:`_effective_temperature`);
         * ``predictions``, ``probabilities``, ``spots`` — для графиков.
 
         :param f01_ghz: частоты перехода 0→1 атомов (ГГц), список или число;
-            если заданы, по термальной населённости оценивается эффективная
-            температура T_eff = h·f01 / (k_B·ln((1−p)/p)). Без частоты
-            температура не вычисляется (из IQ-трасс её не определить).
+            если заданы, по доле верхних уровней в |0⟩-трассах оценивается
+            эффективная температура T_eff = h·f01 / (k_B·ln(p₀/p₁)).
+            Без частоты температура не вычисляется.
         """
         self._require_fitted()
         data = self._check_compatible(data)
@@ -1647,14 +1636,10 @@ class NeuralService:
         ev = self._evaluate(data, indices, batch_size, keep=True)
         result = self._metrics(ev)
         spots = self._spots(data, indices, batch_size)
-        # Бенчмарки и SNR считаются на MTV ПОСЛЕ того же окна и свёртки, что
+        # Бенчмарки считаются на MTV ПОСЛЕ того же окна и свёртки, что
         # и при калибровке центроидов/LDA/QDA (spots без свёртки — для рисунка).
-        prepared_mtv, early_mtv = self._prepared_mtv(data, indices, batch_size)
+        prepared_mtv = self._prepared_mtv(data, indices, batch_size)
         y = data["labels"][indices][:, self.config["atoms"]]
-        # Физика (переходы, термальная доля) — по подготовленным уровням, а не
-        # по псевдометкам утечки, если окно их применило.
-        prepared = data.get("prepared_labels")
-        y_prepared = y if prepared is None else prepared[indices][:, self.config["atoms"]]
         n_atoms = len(self.config["levels"])
         freqs = [None] * n_atoms
         if f01_ghz is not None:
@@ -1680,9 +1665,9 @@ class NeuralService:
                 ok = pred == y[:, a]
                 bench_right[name] &= ok
                 entry["benchmarks"][name] = float(ok.mean())
-            entry["separation"] = self._separation(pts, y[:, a], self.config["levels"][a])
-            early_sep = self._separation(early_mtv[:, a], y[:, a], self.config["levels"][a])
-            entry.update(self._physics(data, indices, a, y_prepared[:, a], freqs[a], early_sep, batch_size))
+            temperature = self._effective_temperature(entry["confusion"], entry["support"], freqs[a])
+            if temperature is not None:
+                entry["effective_temperature_mK"] = temperature
         result["benchmarks"] = {name: float(ok.mean()) for name, ok in bench_right.items()}
         result.update(predictions=ev["predictions"], probabilities=ev["probabilities"], spots=spots,
                       labels=y, indices=indices, shot_ids=data["shot_ids"][indices],
@@ -1691,18 +1676,15 @@ class NeuralService:
         return result
 
     def _prepared_mtv(self, data, indices, batch_size):
-        """MTV после окна и свёртки: (по всей трассе, по ранней трети) [M, A_used]."""
+        """MTV после окна и свёртки: [M, A_used]."""
         n = len(self.config["levels"])
         full = np.empty((len(indices), n), np.complex64)
-        early = np.empty((len(indices), n), np.complex64)
         pos = 0
         for b in self._batches(indices, batch_size):
             x = self._prepare(data["iq"][b])
-            third = max(1, x.shape[-1] // 3)
             full[pos:pos + len(b)] = x.mean(-1)
-            early[pos:pos + len(b)] = x[:, :, :third].mean(-1)
             pos += len(b)
-        return full, early
+        return full
 
     def _data_warnings(self, data) -> list[str]:
         """Предупреждения калибровки модели и несовпадения временной сетки."""
@@ -1734,89 +1716,31 @@ class NeuralService:
         return out
 
     @staticmethod
-    def _separation(pts, y, k) -> list[dict]:
-        """Разделение «пятен» каждой пары уровней на плоскости IQ.
+    @staticmethod
+    def _effective_temperature(cm, support, f01_ghz) -> float | None:
+        """Оценка эффективной температуры по матрице ошибок атома.
 
-        MTV проецируются на прямую через центры двух облаков. SNR =
-        |m_j − m_i| / ((σ_i + σ_j)/2). Ошибка перекрытия двух гауссовых
-        облаков при пороге посередине и равных априорных вероятностях:
-        ½[Φ(−Δ/(2σ_i)) + Φ(−Δ/(2σ_j))] (при σ_i = σ_j это Φ(−SNR/2)).
+        T_eff = h·f01/(k_B·ln(p₀/p₁)): доля трасс, подготовленных в |0⟩,
+        которые сеть отнесла к верхнему уровню, принимается за тепловую
+        населённость p₁, p₀ = 1 − p₁. Оценка опирается на матрицу ошибок,
+        а не на форму трасс, поэтому не требует демодуляции.
+
+        В оценку входят и ошибки подготовки (SPAM), и шум считывания: это
+        диагностика, а не измерение температуры. Для кудита (k > 2) верхние
+        уровни объединяются — используется приближение двух уровней.
+
+        :param cm: матрица ошибок атома (строки — подготовленные уровни).
+        :param support: число трасс, подготовленных в каждом уровне.
+        :param f01_ghz: частота перехода 0→1, ГГц; None — оценки нет.
         """
-        from scipy.special import ndtr
-
-        out = []
-        for i, j in itertools.combinations(range(k), 2):
-            a, b = pts[y == i], pts[y == j]
-            if len(a) < 2 or len(b) < 2:
-                out.append(dict(pair=(i, j), snr=None, overlap_error=None))
-                continue
-            axis = b.mean() - a.mean()
-            if abs(axis) == 0:
-                out.append(dict(pair=(i, j), snr=0.0, overlap_error=0.5))
-                continue
-            u = axis / abs(axis)
-            pa, pb = (a * np.conj(u)).real, (b * np.conj(u)).real
-            gap = abs(pb.mean() - pa.mean())
-            sa, sb = max(pa.std(), 1e-30), max(pb.std(), 1e-30)
-            snr = gap / ((sa + sb) / 2)
-            overlap = 0.5 * (ndtr(-gap / (2 * sa)) + ndtr(-gap / (2 * sb)))
-            out.append(dict(pair=(i, j), snr=float(snr), overlap_error=float(overlap)))
-        return out
-
-    def _physics(self, data, indices, a, y, f01_ghz, separation, batch_size) -> dict:
-        """Оценки ошибок распада и «температуры» по трассам атома a.
-
-        * ``transition_down[i]`` / ``transition_up[i]`` — доля трасс,
-          подготовленных в i, у которых ранняя треть трассы у центра i, а
-          поздняя — у центра ниже/выше i: переход во время считывания
-          (распад T1 / возбуждение измерением). Эвристика, а не измерение T1.
-        * ``thermal_population`` — НАБЛЮДАЕМАЯ доля трасс, подготовленных в
-          |0⟩, у которых уже ранняя треть ближе к |1⟩ или выше (диагностика).
-          Наблюдаемая доля = p₁(1−ε₁₀) + (1−p₁)ε₀₁, где ε — ошибки назначения
-          в раннем окне; без калибровки ε она не равна термальной населённости
-          p₁ и в общем случае не является ни верхней, ни нижней её оценкой.
-        * ``thermal_corrected`` — та же доля минус оценка перекрытия облаков
-          Φ(−SNR₀₁/2), посчитанная по MTV ТОЙ ЖЕ ранней трети (не меньше 0).
-        * ``effective_temperature_mK`` — T_eff = h·f01/(k_B·ln(p0/p1)) по
-          наблюдаемым долям уровней 0 и 1 в начале |0⟩-трасс (p1 минус
-          перекрытие облаков) при заданной f01, иначе None. Это оценка без
-          коррекции ошибок подготовки и считывания.
-        Все величины включают SPAM; это диагностика для сравнения, а не замена
-        отдельной калибровки T1 и температуры.
-        """
-        k = self.config["levels"][a]
-        means = self.filters["means"][a]
-        third = max(1, means.shape[-1] // 3)
-        early_ref, late_ref = means[:, :third].mean(-1), means[:, -third:].mean(-1)
-        early = np.empty(len(indices), np.int64)
-        late = np.empty(len(indices), np.int64)
-        pos = 0
-        for b in self._batches(indices, batch_size):
-            tr = self._prepare(data["iq"][b])[:, a]
-            early[pos:pos + len(b)] = np.abs(tr[:, :third].mean(-1)[:, None] - early_ref).argmin(1)
-            late[pos:pos + len(b)] = np.abs(tr[:, -third:].mean(-1)[:, None] - late_ref).argmin(1)
-            pos += len(b)
-        down, up = [], []
-        for i in range(k):
-            ok = (y == i) & (early == i)
-            down.append(float(np.mean(late[ok] < i)) if ok.any() else None)
-            up.append(float(np.mean(late[ok] > i)) if ok.any() else None)
-        zero = y == 0
-        p_th = float(np.mean(early[zero] > 0)) if zero.any() else None
-        overlap = separation[0]["overlap_error"] if separation and separation[0]["pair"] == (0, 1) else None
-        corrected = None if p_th is None or overlap is None else max(p_th - overlap, 0.0)
-        t_eff = None
-        if f01_ghz is not None and zero.any() and overlap is not None:
-            # Больцман для пары уровней 0 и 1: p1/p0 = exp(−h·f01/(k_B·T)). Берётся
-            # именно отношение p1/p0 (а не сумма всех верхних уровней — для кудита
-            # это другая величина); p1 поправлено на перекрытие облаков 0|1.
-            p1 = max(float(np.mean(early[zero] == 1)) - overlap, 0.0)
-            p0 = float(np.mean(early[zero] == 0)) + overlap
-            if 0 < p1 < p0:
-                h, k_b = 6.62607015e-34, 1.380649e-23
-                t_eff = h * float(f01_ghz) * 1e9 / (k_b * math.log(p0 / p1)) * 1e3
-        return dict(transition_down=down, transition_up=up, thermal_population=p_th,
-                    thermal_corrected=corrected, effective_temperature_mK=t_eff)
+        if f01_ghz is None or len(cm) < 2 or not support[0]:
+            return None
+        p_exc = float(cm[0, 1:].sum()) / float(support[0])
+        p0 = 1.0 - p_exc
+        if not 0 < p_exc < p0:
+            return None
+        h, k_b = 6.62607015e-34, 1.380649e-23
+        return h * float(f01_ghz) * 1e9 / (k_b * math.log(p0 / p_exc)) * 1e3
 
     def classify_and_plot(self, data, atoms=None, *, max_points=5000, color_by="prediction"):
         """Классифицировать набор и построить «пятна» IQ (MTV) выбранных атомов.

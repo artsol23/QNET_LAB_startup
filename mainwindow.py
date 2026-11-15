@@ -40,7 +40,7 @@ macro-F1, XEB, матрица ошибок). Каждый график вклю�
 данных, применение фильтров модели, гистограммы выходов фильтров) и
 «Распознавание» (валидация по меткам, классификация без меток, экспорт).
 Справа — графики эффективности классификатора: пятна IQ, матрицы ошибок,
-бенчмарки (NN против центроида/LDA/QDA), ошибки распада и «температуры»,
+бенчмарки (NN против центроида/LDA/QDA), ошибки распада и возбуждения,
 гистограммы и ядра фильтров, кривые IQ. Одновременно показывается не более
 пяти атомов — пользователь сам отмечает, какие.
 
@@ -135,7 +135,7 @@ class MainWindow(QMainWindow):
         "confusion": ("Матрица ошибок (validation)", None, None),
     }
     HISTORY_KEYS = HISTORY_KEYS
-    VALIDATION_VIEWS = ("Пятна IQ", "Матрицы ошибок", "Бенчмарки", "Распад и температура",
+    VALIDATION_VIEWS = ("Пятна IQ", "Матрицы ошибок", "Бенчмарки", "Распад и возбуждение",
                         "Гистограммы фильтров", "Ядра фильтров", "Кривые IQ")
 
     # ==================================================================
@@ -744,10 +744,6 @@ class MainWindow(QMainWindow):
         classify = QPushButton("Классифицировать новые данные")
         classify.clicked.connect(self.classify_external)
         form.addRow(classify)
-        self.f01_edit = QLineEdit()
-        self.f01_edit.setPlaceholderText("напр. 5.1, 4.9 (ГГц) — для T_eff")
-        self.f01_edit.setToolTip("Частоты переходов 0→1 атомов; без них температура не оценивается")
-        form.addRow("f01 атомов, ГГц", self.f01_edit)
         layout.addWidget(box)
         box = QGroupBox("Экспорт в папку проекта")
         form = QVBoxLayout(box)
@@ -1878,7 +1874,7 @@ class MainWindow(QMainWindow):
                     epochs=self.epochs_spin.value(), batch=self.batch_spin.value(),
                     val_fraction=self.val_fraction.value(), test_fraction=self.test_fraction.value(),
                     seed=self.seed_spin.value(), charts=[k for k, c in self.chart_checks.items() if c.isChecked()],
-                    view=self.view_combo.currentText(), f01=self.f01_edit.text(),
+                    view=self.view_combo.currentText(),
                     mode="validation" if self.mode_button.isChecked() else "training",
                     model=self.model_combo.currentData(), per_atom=self.per_atom_check.isChecked(),
                     auto_layers=self.auto_layers.isChecked(), hidden=self.hidden_edit.text(),
@@ -1908,7 +1904,6 @@ class MainWindow(QMainWindow):
             for key, check in self.chart_checks.items():
                 check.setChecked(key in charts)
             self.view_combo.setCurrentText(s.get("view", self.VALIDATION_VIEWS[0]))
-            self.f01_edit.setText(s.get("f01", ""))
             if "model" in s:
                 self.model_combo.setCurrentIndex(max(0, self.model_combo.findData(s["model"])))
                 self.per_atom_check.setChecked(bool(s.get("per_atom", True)))
@@ -2115,7 +2110,6 @@ class MainWindow(QMainWindow):
         dataset_role,
         data,
         indices=None,
-        f01=None,
     ):
         """Запустить расчёт с фиксацией происхождения результата."""
         if self._busy:
@@ -2185,9 +2179,6 @@ class MainWindow(QMainWindow):
                 },
                 "dataset_role": dataset_role,
                 "selection": selection,
-                "evaluation_parameters": {
-                    "f01_ghz": copy.deepcopy(f01),
-                },
             }
 
         metadata = self._guard(prepare)
@@ -2241,7 +2232,6 @@ class MainWindow(QMainWindow):
             self._check_split()
 
             return {
-                "f01": self._f01(),
                 "fingerprint": self._train_fingerprint(),
             }
 
@@ -2267,20 +2257,17 @@ class MainWindow(QMainWindow):
         service = self.service
         data = self.train_data
         indices = self.split["test"].copy()
-        f01 = checked["f01"]
 
         self._run_evaluation(
             "Проверка на test",
             lambda: service.validate(
                 data,
                 indices,
-                f01_ghz=f01,
             ),
             source="отложенный test",
             dataset_role="train",
             data=data,
             indices=indices,
-            f01=f01,
         )
 
     # ------------------------------------------------------------------
@@ -2513,16 +2500,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Валидация, классификация, фильтры
     # ------------------------------------------------------------------
-    def _f01(self):
-        text = self.f01_edit.text().strip()
-        if not text:
-            return None
-        try:
-            values = [float(v) for v in text.replace(";", ",").split(",") if v.strip()]
-        except ValueError as exc:
-            raise ValueError("f01: числа в ГГц через запятую.") from exc
-        return values[0] if len(values) == 1 else values
-
     def _need_eval(self, labels=False):
         if not self.service.is_fitted:
             raise ValueError("Сначала обучите сеть или загрузите веса.")
@@ -2538,7 +2515,6 @@ class MainWindow(QMainWindow):
 
         def check():
             self._need_eval(labels=True)
-            return {"f01": self._f01()}
 
         checked = self._guard(check)
 
@@ -2547,18 +2523,13 @@ class MainWindow(QMainWindow):
 
         service = self.service
         data = self.eval_data
-        f01 = checked["f01"]
 
         self._run_evaluation(
             "Валидация",
-            lambda: service.validate(
-                data,
-                f01_ghz=f01,
-            ),
+            lambda: service.validate(data),
             source="экспериментальные данные",
             dataset_role="eval",
             data=data,
-            f01=f01,
         )
 
     def classify_external(self):
@@ -2616,11 +2587,6 @@ class MainWindow(QMainWindow):
             self.mode_button.setChecked(True)
             self.view_combo.setCurrentText("Гистограммы фильтров")
             lines = []
-            for atom, entry in result.items():
-                ef = entry.get("event_fraction")
-                if ef:
-                    lines.append(f"Атом {atom}: помечено как распад {self._pct(ef['relaxation'])}, "
-                                 f"как возбуждение {self._pct(ef['excitation'])} (правило {ef['rule']}).")
             self.details.setPlainText("\n".join(lines) or "Фильтры применены.")
             self._log("Фильтры применены к экспериментальным данным.")
         self._run("Применение фильтров", lambda: self.service.filter_diagnostics(data, atoms=atoms or None), done)
@@ -2645,25 +2611,17 @@ class MainWindow(QMainWindow):
     def _details_text(self, r: dict) -> str:
         lines = []
         for p in r.get("per_atom", []):
-            sep = ", ".join(f"{i}|{j}: SNR {s['snr']:.2f}" for s in p.get("separation", []) if s["snr"] is not None
-                            for i, j in [s["pair"]])
-            t = p.get("effective_temperature_mK")
             lines.append(f"Атом {p['atom']}: точность {self._pct(p['accuracy'])}, fidelity {self._pct(p['assignment_fidelity'])}; "
                          f"ошибка распада по уровням {[self._pct(v) for v in p['decay_error']]}; "
-                         f"возбуждения {[self._pct(v) for v in p['excitation_error']]}; "
-                         f"наблюдаемая доля |0⟩, рано попавших в облако выше (диагностика) "
-                         f"{self._pct(p.get('thermal_population'))}, за вычетом перекрытия облаков в том же окне "
-                         f"{self._pct(p.get('thermal_corrected'))}"
-                         + ("" if t is None else f", T_eff ≈ {t:.1f} мК (по наблюдаемой доле, без коррекции ошибок считывания)") + (f"; {sep}" if sep else ""))
+                         f"возбуждения {[self._pct(v) for v in p['excitation_error']]}")
         lines += [str(w) for w in r.get("warnings", [])]
         if r.get("excluded"):
             lines.append(f"Исключено измерений с уровнями выше заданных: {r['excluded']}.")
-        lines.append("Ошибки распада/возбуждения и доля ранних возбуждений включают ошибки подготовки (SPAM) и "
-                     "перекрытие облаков: без отдельной калибровки считывания они не разделяют термальную "
-                     "населённость и ошибки назначения: это диагностика, а не оценка сверху или снизу. T_eff — только при заданной f01. "
+        lines.append("Ошибки распада и возбуждения посчитаны по матрице ошибок: это доля измерений, "
+                     "отнесённых сетью к уровню ниже или выше подготовленного, вместе с ошибками "
+                     "подготовки (SPAM) и шумом считывания. "
                      "XEB по меткам — accuracy регистра с поправкой на угадывание (D·acc−1)/(D−1), а не "
-                     "независимая квантовая fidelity; linear XEB считается только при ideal_probs в данных. "
-                     "* На графике «Распад и температура» T_eff — по наблюдаемой доле, без коррекции ошибок считывания.")
+                     "независимая квантовая fidelity; linear XEB считается только при ideal_probs в данных.")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -2922,7 +2880,7 @@ class MainWindow(QMainWindow):
         if not atoms:
             self._message(fig, canvas, "Выбранные атомы не используются моделью.")
             return
-        if view in ("Матрицы ошибок", "Бенчмарки", "Распад и температура") and "per_atom" not in r:
+        if view in ("Матрицы ошибок", "Бенчмарки", "Распад и возбуждение") and "per_atom" not in r:
             self._message(fig, canvas, "Для этого графика нужны данные с метками (валидация).")
             return
         fig.clear()
