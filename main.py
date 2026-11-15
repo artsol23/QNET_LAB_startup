@@ -168,6 +168,47 @@ def make_splash(app):
     return splash, bar, label
 
 
+def apply_light_palette(app) -> None:
+    """Задать приложению светлую палитру, не завися от темы рабочего стола.
+
+    На Windows элементы рисует нативный стиль, и палитра почти ни на что не
+    влияет. В Linux Qt собирает палитру из GTK-темы: при тёмной теме GNOME
+    (Yaru-dark) поля ввода, списки, вкладки и область отчёта становились
+    тёмно-серыми на светлом окне, потому что QSS главного окна задаёт цвета
+    лишь части виджетов. Палитра ниже возвращает им светлый фон, а галочки
+    флажков и бегунки остаются штатными — в отличие от правил QSS, которые
+    заменили бы их отрисовку.
+    """
+    from PyQt6.QtGui import QColor, QPalette
+
+    palette = QPalette()
+    for role, color in {
+        QPalette.ColorRole.Window: "#f3f6fa",
+        QPalette.ColorRole.WindowText: "#17253c",
+        QPalette.ColorRole.Base: "#ffffff",
+        QPalette.ColorRole.AlternateBase: "#f3f6fa",
+        QPalette.ColorRole.Text: "#17253c",
+        QPalette.ColorRole.Button: "#ffffff",
+        QPalette.ColorRole.ButtonText: "#17253c",
+        QPalette.ColorRole.Highlight: "#1f5bb4",
+        QPalette.ColorRole.HighlightedText: "#ffffff",
+        QPalette.ColorRole.ToolTipBase: "#ffffff",
+        QPalette.ColorRole.ToolTipText: "#17253c",
+    }.items():
+        palette.setColor(role, QColor(color))
+    # Выключенные поля: серый фон и серый текст, иначе они выглядели бы как
+    # доступные для ввода.
+    for role, color in {
+        QPalette.ColorRole.Base: "#eef1f5",
+        QPalette.ColorRole.Text: "#9aa6b6",
+        QPalette.ColorRole.Button: "#eef1f5",
+        QPalette.ColorRole.ButtonText: "#9aa6b6",
+        QPalette.ColorRole.WindowText: "#9aa6b6",
+    }.items():
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor(color))
+    app.setPalette(palette)
+
+
 def run_gui(license_path: Path) -> int:
     """Показать заставку, проверить лицензию и (при успехе) открыть главное окно."""
     preload_system_icu()
@@ -180,6 +221,7 @@ def run_gui(license_path: Path) -> int:
 
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Q-Net Lab")
+    apply_light_palette(app)
     splash, bar, label = make_splash(app)
 
     def progress(percent: int, text: str) -> None:

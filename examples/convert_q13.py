@@ -24,6 +24,10 @@
 2300, 1150, 460, 230 и 115 отсчётов дают одинаковый результат, поэтому берётся
 наименьший объём без потерь.
 
+Файл ``Q13.npz`` — zip-архив, и он читается в память целиком (около 600 МБ
+на два порта): пошаговая обработка ограничивает только результат, а не чтение
+исходника.
+
 Запуск (из любого каталога)::
 
     python examples/convert_q13.py
@@ -66,7 +70,8 @@ def convert(src, dst, *, decim=DECIM, chunk=CHUNK, f_atoms=F_ATOMS):
         raise ValueError("Число состояний или каналов не соответствует STATES.")
 
     mixer = [np.exp(-2j * np.pi * f * np.arange(n_samples)).astype(np.complex64) for f in f_atoms]
-    n_out = n_samples // decim
+    # resample_poly округляет число отсчётов вверх: n_samples // decim не годится.
+    n_out = -(-n_samples // decim)
     iq = np.empty((n_shots * n_states, len(f_atoms), n_out), dtype=np.complex64)
     labels = np.tile(STATES, (n_shots, 1))
 

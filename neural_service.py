@@ -91,6 +91,7 @@ import itertools
 import math
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -767,9 +768,10 @@ class NeuralService:
            правило ``segments`` — ранний сегмент у c_s, поздний у c_j;
         5. QMF для каждой пары (i<j), RMF для j→i и EMF для i→j: ядро
            строится между средней трассой событий и «чистыми» трассами
-           исходного уровня. Если событий меньше ``min_events``, ядро
-           нулевое (признак всегда 0) и выдаётся предупреждение —
-           искусственных событий не создаётся.
+           исходного уровня. Если событий меньше ``min_events`` или
+           чистых трасс уровня меньше двух, ядро нулевое (признак всегда
+           0) и выдаётся предупреждение — искусственных событий не
+           создаётся.
         """
         x_all, y_all = data["iq"], data["labels"]
         levels, fc = config["levels"], config["filter_config"]
@@ -786,7 +788,7 @@ class NeuralService:
 
         for a, k in enumerate(levels):
             ya = y_all[indices, config["atoms"][a]]   # метки КАНАЛА атома, а не позиции в списке
-            means, var_i, var_q, mtv_stats = [], [], [], []
+            means, var_i, var_q = [], [], []
             for s in range(k):
                 sel = indices[ya == s]
                 if len(sel) < 2:
@@ -836,8 +838,9 @@ class NeuralService:
                         kernel = self._matched_kernel(ev_mean - cl_mean, ev_vi + cl_vi, ev_vq + cl_vq, reg)
                     else:
                         filters["warnings"].append(
-                            f"{kind} атом {config['atoms'][a]}, {source}→{target}: найдено {len(event_sel)} трасс-событий "
-                            f"(нужно ≥ {fc['min_events']}); фильтр не откалиброван, его признак равен 0.")
+                            f"{kind} атом {config['atoms'][a]}, {source}→{target}: трасс-событий "
+                            f"{len(event_sel)} (нужно ≥ {fc['min_events']}), чистых трасс уровня "
+                            f"{len(clean_sel)} (нужно ≥ 2); фильтр не откалиброван, его признак равен 0.")
                     self._add_kernel(filters, a, kernel, kind, source, target, available, int(len(event_sel)))
         if config["mode"] == "matched" and not any(d["available"] for d in filters["descriptions"]):
             raise ValueError("Не удалось откалибровать ни одного фильтра. Включите QMF или добавьте данные.")
@@ -1108,6 +1111,24 @@ class NeuralService:
     # ------------------------------------------------------------------
     # Сеть
     # ------------------------------------------------------------------
+    @staticmethod
+    def auto_hidden_layers(config, feature_count: int) -> list[int]:
+        """Скрытые слои по умолчанию: ⌊P/2⌋, ⌊P/4⌋ с нижними границами.
+
+        Для сетей на каждый атом — не уже [2k+2, k+1], для общей сети —
+        не уже [4·Σk, 2·Σk], иначе узкое горлышко не вместит все выходы.
+
+        :param config: конфигурация (см. :meth:`configure`).
+        :param feature_count: P — число входов сети.
+        """
+        if config["per_atom_networks"]:
+            k_max = max(config["levels"])
+            return [max(feature_count // 2, 2 * k_max + 2),
+                    max(feature_count // 4, k_max + 1)]
+        outputs = sum(config["levels"])
+        return [max(feature_count // 2, 4 * outputs),
+                max(feature_count // 4, 2 * outputs)]
+
     def _build_model(self, config, feature_count) -> nn.Module:
         """Создать FNN по конфигурации; P = feature_count входов.
 
@@ -1120,15 +1141,8 @@ class NeuralService:
         """
         hidden = config["hidden_layers"]
         if hidden is None:
-            if config["per_atom_networks"]:
-                # Как в статье, но не уже 2k+2 и k+1 нейронов (k — уровней атома):
-                # при малом P (один кубит, P = 3) слои ⌊P/2⌋, ⌊P/4⌋ = 1, 0 вырождаются.
-                k_max = max(config["levels"])
-                hidden = [max(feature_count // 2, 2 * k_max + 2), max(feature_count // 4, k_max + 1)]
-            else:
-                # Общей сети нужен запас: выходов Σk, а не k одного атома.
-                outputs = sum(config["levels"])
-                hidden = [max(feature_count // 2, 4 * outputs), max(feature_count // 4, 2 * outputs)]
+            # Как в статье: [⌊P/2⌋, ⌊P/4⌋] с нижними границами.
+            hidden = self.auto_hidden_layers(config, feature_count)
         act = self.ACTIVATIONS[config["activation"]]
 
         def mlp(out_size):
@@ -1198,8 +1212,10 @@ class NeuralService:
 
         :param data: словарь данных с labels.
         :param train_indices: номера измерений для обучения (None — все).
-        :param val_indices: номера измерений validation из ``data``.
-        :param val_data: отдельный набор для validation (вместо val_indices).
+        :param val_indices: номера измерений validation: из ``data`` либо из
+            ``val_data``, если он задан.
+        :param val_data: отдельный набор для validation. Если заданы и
+            ``val_indices``, берутся только они; иначе — весь ``val_data``.
         :param config: новая конфигурация (результат :meth:`configure`);
             None — текущая.
         :param epochs: число эпох.
@@ -1228,6 +1244,7 @@ class NeuralService:
         if str(optimizer).lower() not in names:
             raise ValueError(f"Оптимизатор: {', '.join(self.OPTIMIZERS)}.")
         optimizer = names[str(optimizer).lower()]
+        source_data = data
         data = self._check_data(data)
         if data["labels"] is None:
             raise ValueError("Для обучения нужны метки (labels).")
@@ -1253,25 +1270,32 @@ class NeuralService:
         if len(train_idx) < 2:
             raise ValueError("После проверки меток в train осталось меньше двух измерений.")
         if val_data is not None:
+            # Тот же набор, что и train? Тогда индексы train и validation
+            # сравнимы и пересечение запрещено.
+            same_source = val_data is source_data
             val_data = self._check_data(val_data)
             if val_data["iq"].shape[2] != data["iq"].shape[2] or max(config["atoms"]) >= val_data["iq"].shape[1]:
                 raise ValueError("Validation-набор должен иметь ту же длину трасс и нужные атомы, что и train.")
             if (data["time_ns"] is None) != (val_data["time_ns"] is None) or (
                     data["time_ns"] is not None and not np.allclose(data["time_ns"], val_data["time_ns"], rtol=1e-6)):
                 raise ValueError("Временные сетки train и validation различаются.")
-            val_idx, _ = self._usable(val_data, self._indices(val_data, None), config)
+            # Если заданы val_indices, они относятся к val_data, а не ко всему набору.
+            val_idx, _ = self._usable(val_data, self._indices(val_data, val_indices), config)
         elif val_indices is not None:
+            same_source = True
             val_data = data
             val_idx, _ = self._usable(data, self._indices(data, val_indices), config)
-            if np.intersect1d(val_idx, train_idx).size:
-                raise ValueError("Train и validation пересекаются — передайте непересекающиеся индексы.")
         else:
+            same_source = True
             val_idx = None
+        if same_source and val_idx is not None and np.intersect1d(val_idx, train_idx).size:
+            raise ValueError("Train и validation пересекаются — передайте непересекающиеся индексы.")
         warnings = []
         if excluded_train:
             warnings.append(f"Из train исключено {excluded_train} измерений с уровнями выше заданных.")
         if self._cancelled(cancel_event):
-            return dict(cancelled=True, epochs_completed=0, total_epochs=self.trained_epochs, last={}, warnings=warnings)
+            return dict(cancelled=True, epochs_completed=0, total_epochs=self.trained_epochs, last={},
+                        warnings=warnings, excluded=excluded_train)
 
         if not fine_tune:
             # Кандидат: всё считается в локальных переменных, затем атомарная замена.
@@ -1334,12 +1358,20 @@ class NeuralService:
                         raise ValueError("Loss стал NaN/Inf — уменьшите learning rate и проверьте данные.")
                     loss.backward()
                     nn.utils.clip_grad_norm_(self.model.parameters(), 10.0)
+                    with torch.no_grad():
+                        # Точность обучения считается без dropout: в режиме train
+                        # она зависела от случайного маскирования и потому была
+                        # несопоставима с точностью на validation.
+                        self.model.eval()
+                        try:
+                            clean = self._logits(features)
+                        finally:
+                            self.model.train()
+                        pred = torch.stack([h.argmax(1) for h in self._split_logits(clean)], 1)
+                        right += int(torch.all(pred == target, dim=1).sum())
                     opt.step()
                     self.update_steps += 1
                     self._fitted = True
-                    with torch.no_grad():
-                        pred = torch.stack([h.argmax(1) for h in self._split_logits(logits)], 1)
-                        right += int(torch.all(pred == target, dim=1).sum())
                     seen += len(b)
                     loss_sum += loss.item() * len(b)
                 if cancelled:
@@ -1517,7 +1549,7 @@ class NeuralService:
             precision = np.divide(np.diag(cm), col, out=np.zeros(len(cm)), where=col > 0)
             f1 = np.divide(2 * precision * recall, precision + recall, out=np.zeros(len(cm)),
                            where=(precision + recall) > 0)
-            fid = float(recall[support > 0].mean()) if np.all(support > 0) else None
+            fid = float(recall[support > 0].mean()) if np.any(support > 0) else None
             down = [float(cm[i, :i].sum() / support[i]) if support[i] else None for i in range(len(cm))]
             up = [float(cm[i, i + 1:].sum() / support[i]) if support[i] else None for i in range(len(cm))]
             out["per_atom"].append(dict(atom=self.config["atoms"][a], confusion=cm, support=support,
@@ -1879,7 +1911,7 @@ class NeuralService:
                       optimizer_name=self.optimizer_name,
                       optimizer_state=self.optimizer_state if include_optimizer else None,
                       metadata=self._pack(metadata or {}))
-        temporary = path.with_name(path.name + ".tmp")
+        temporary = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
         try:
             torch.save(bundle, temporary)
             temporary.replace(path)

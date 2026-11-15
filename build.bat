@@ -42,9 +42,14 @@ for %%F in (
     )
 )
 
-if not exist "examples\" (
-    echo ERROR: The examples directory is missing.
-    goto failed
+rem Demo data for the build: only the demo_* files.
+rem The raw Q13.npz and q13_2qubits.npz (over 800 MB) stay out of the build.
+set "DEMO_FILES=demo_register_5x3.npz demo_experiment_5x3.npz demo_unlabeled_5x3.npz demo_qubit_leakage_wide.csv demo_long_2atoms.csv"
+for %%F in (%DEMO_FILES%) do (
+    if not exist "examples\%%F" (
+        echo ERROR: Required demo file is missing: examples\%%F
+        goto failed
+    )
 )
 
 rem Read the application version from Python
@@ -151,7 +156,11 @@ echo Building executable...
     --add-data "%PROJECT_DIR%\license.json:." ^
     --add-data "%PROJECT_DIR%\UserGuide.html:." ^
     --add-data "%PROJECT_DIR%\README.txt:." ^
-    --add-data "%PROJECT_DIR%\examples:examples" ^
+    --add-data "%PROJECT_DIR%\examples\demo_register_5x3.npz:examples" ^
+    --add-data "%PROJECT_DIR%\examples\demo_experiment_5x3.npz:examples" ^
+    --add-data "%PROJECT_DIR%\examples\demo_unlabeled_5x3.npz:examples" ^
+    --add-data "%PROJECT_DIR%\examples\demo_qubit_leakage_wide.csv:examples" ^
+    --add-data "%PROJECT_DIR%\examples\demo_long_2atoms.csv:examples" ^
     "%PROJECT_DIR%\main.py"
 if errorlevel 1 exit /b 1
 
