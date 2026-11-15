@@ -10,13 +10,17 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 from PyQt6.QtWidgets import QApplication
 
+import plotting
 from neural_service import NeuralService
+from project_store import ProjectStore
 
 app = QApplication.instance() or QApplication([])
 
@@ -114,6 +118,56 @@ class FilterDiagnosticsTests(unittest.TestCase):
 
         for entry in diagnostics.values():
             self.assertNotIn("event_fraction", entry)
+
+
+class LeakageSearchRemovedTests(unittest.TestCase):
+    """Поиск утечки удалён целиком."""
+
+    def test_service_has_no_leakage_methods(self):
+        self.assertFalse(hasattr(NeuralService, "find_leakage"))
+        self.assertFalse(hasattr(NeuralService, "leakage_labels"))
+
+    def test_window_has_no_leakage_controls(self):
+        window = MainWindow()
+        try:
+            self.assertFalse(hasattr(window, "find_leakage"))
+            self.assertFalse(hasattr(window, "_leakage_found"))
+            self.assertFalse(hasattr(window, "_draw_leakage"))
+            self.assertFalse(hasattr(window, "leak_atom"))
+        finally:
+            window._tasks.shutdown()
+
+    def test_plotting_has_no_leakage_graph(self):
+        self.assertFalse(hasattr(plotting, "draw_leakage"))
+
+    def test_corrected_labels_applied_without_prepared_copy(self):
+        folder = Path(tempfile.mkdtemp())
+        data_file = folder / "data.npz"
+        labels = np.array([[0], [1]], dtype=np.int64)
+        np.savez(data_file, iq=np.zeros((2, 1, 4), dtype=np.complex64), labels=labels)
+        override = folder / "labels.npy"
+        np.save(override, np.array([[1], [0]], dtype=np.int64))
+
+        store = ProjectStore(folder)
+        entry = {
+            "file": str(data_file),
+            "sha256": store.sha256(data_file),
+            "labels_override": str(override),
+        }
+        warnings = []
+
+        loaded = store.read_dataset(
+            entry,
+            warnings,
+            lambda path: {
+                "iq": np.zeros((2, 1, 4), dtype=np.complex64),
+                "labels": labels.copy(),
+            },
+        )
+
+        self.assertEqual(warnings, [])
+        self.assertNotIn("prepared_labels", loaded)
+        self.assertEqual(loaded["labels"].tolist(), [[1], [0]])
 
 
 class InterfaceTests(unittest.TestCase):

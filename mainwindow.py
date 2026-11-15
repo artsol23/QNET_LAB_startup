@@ -162,7 +162,6 @@ class MainWindow(QMainWindow):
         self.result_metadata: dict | None = None
         self.result_source = ""                   # описание набора для отчётов
         self.diagnostics: dict | None = None      # filter_diagnostics()
-        self.leakage: dict | None = None          # предложение find_leakage()
         self.current_weights: str | None = None   # имя файла весов в проекте
         self.model_fingerprint: str | None = None  # отпечаток train, на котором обучены текущие веса
         self.dirty = False                        # есть несохранённые изменения модели
@@ -460,15 +459,6 @@ class MainWindow(QMainWindow):
         self.split_info = QLabel("Разделение не выполнено")
         self.split_info.setWordWrap(True)
         form.addRow(self.split_info)
-        leak_row = QHBoxLayout()
-        self.leak_atom = self._spin(0, 255, 0)
-        leak_row.addWidget(QLabel("Атом"))
-        leak_row.addWidget(self.leak_atom)
-        leak_button = QPushButton("Поиск утечки в |2⟩ (спектр. кластеризация)")
-        leak_button.setToolTip("§V-A статьи: найти естественную утечку по MTV и предложить метки уровня 2")
-        leak_button.clicked.connect(self.find_leakage)
-        leak_row.addWidget(leak_button)
-        form.addRow(leak_row)
         layout.addWidget(box)
 
         # 2. Архитектура
@@ -1057,7 +1047,7 @@ class MainWindow(QMainWindow):
     def _reset_state(self):
         self.train_data = self.eval_data = self.split = None
         self.manifest_name = "project.json"
-        self.history, self.train_eval, self.result, self.diagnostics, self.leakage = [], None, None, None, None
+        self.history, self.train_eval, self.result, self.diagnostics = [], None, None, None
         self._train_rollback = None
         self.current_weights = None
         self.model_fingerprint = None
@@ -1439,7 +1429,7 @@ class MainWindow(QMainWindow):
         role, data, entry = payload
         self.manifest.setdefault("datasets", {})[role] = entry
         if role == "train":
-            self.train_data, self.split, self.leakage = data, None, None
+            self.train_data, self.split = data, None
             self.split_info.setText("Новые данные: выполните разделение.")
             self.train_info.setText(self._describe_data(data, "train"))
             n_atoms = data["iq"].shape[1]
@@ -1549,7 +1539,7 @@ class MainWindow(QMainWindow):
         # Фактический SHA прочитанного файла (если файл менялся после импорта —
         # именно его содержимое), а не только SHA, записанный при импорте.
         digest.update(str(entry.get("actual_sha256") or entry.get("sha256")).encode())
-        # Содержимое меток train (в т.ч. псевдометок утечки), а не только имя файла.
+        # Содержимое меток train, а не только имя файла.
         digest.update(np.ascontiguousarray(self.train_data["labels"][self.split["train"]]).tobytes())
         digest.update(np.asarray(self.split["train"], np.int64).tobytes())
         return digest.hexdigest()
@@ -1563,72 +1553,6 @@ class MainWindow(QMainWindow):
         joined = np.concatenate([self.split[k] for k in ("train", "validation", "test")])
         if len(np.unique(joined)) != len(joined) or joined.min() < 0 or joined.max() >= n:
             raise ValueError("Разделение в проекте повреждено — выполните его заново.")
-
-    def find_leakage(self):
-        """§V-A статьи: предложить метки утечки в |2⟩ для атома и спросить пользователя."""
-        if self._busy:
-            return
-
-        atom, seed = self.leak_atom.value(), self.seed_spin.value()   # виджеты читаются в главном потоке
-
-        def work():
-            if self.train_data is None or self.split is None:
-                raise ValueError("Загрузите обучающие данные с метками и выполните разделение.")
-            # Кластеры подбираются ТОЛЬКО по train (по подготовленным меткам, если
-            # разметка уже применялась). Validation и test размечаются по найденным
-            # центрам без повторного подбора — они не участвуют в предобработке.
-            data = dict(self.train_data)
-            if data.get("prepared_labels") is not None:
-                data["labels"] = data["prepared_labels"]
-            proposal = self.service.find_leakage(data, atom, indices=self.split["train"], seed=seed)
-            proposal["other_indices"] = np.concatenate([self.split["validation"], self.split["test"]])
-            proposal["other_labels"] = self.service.leakage_labels(data, proposal, proposal["other_indices"])
-            return proposal
-        self._run("Поиск утечки (спектральная кластеризация)", work, self._leakage_found)
-
-    def _leakage_found(self, result: dict):
-        self.leakage = result
-        atom = result["atom"]
-        self.view_combo.setCurrentText("Пятна IQ")
-        self._draw_leakage(result, atom)
-        text = (f"Атом {atom}: размеры кластеров {result['cluster_sizes']}; сопоставление кластер→уровень "
-                f"{result['mapping']}; кандидатов утечки в |{result['leaked_level']}⟩: {result['leaked_count']}; "
-                f"согласие остальных кластеров с подготовкой: {self._pct(result['agreement'])}.")
-        if result["warnings"]:
-            text += "\n\nПРЕДУПРЕЖДЕНИЯ: " + " ".join(result["warnings"])
-        self._log(text)
-        answer = QMessageBox.question(
-            self, "Поиск утечки",
-            text + "\n\nЭто гипотеза по кластерам MTV, а не измерение. Применить предложенные метки? "
-            "Кластеры ищутся только по train; validation и test размечаются по найденным центрам кластеров "
-            "без повторной кластеризации. Подготовленные метки сохраняются отдельно (для физической диагностики). Исправленные метки будут сохранены в папке проекта.")
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        if self.train_data.get("prepared_labels") is None:
-            self.train_data["prepared_labels"] = self.train_data["labels"]
-        labels = self.train_data["labels"].copy()
-        labels[result["indices"], atom] = result["labels"]
-        labels[result["other_indices"], atom] = result["other_labels"]
-        self.train_data["labels"] = labels
-        path = self._unique("data", "labels_leakage", ".npy")
-        np.save(path, labels)
-        self.manifest["datasets"]["train"]["labels_override"] = self._relative(path)
-        self.manifest = self._manifest_now()
-        self._write_json(self._manifest_path(), self.manifest)
-        self.train_info.setText(self._describe_data(self.train_data, "train"))
-        # Число уровней только растёт: явно заданное пользователем значение
-        # (например, 3 для кудита) не должно уменьшиться из-за меток утечки.
-        from_labels = [int(v) + 1 for v in labels.max(axis=0)]
-        try:
-            current = self._ints(self.levels_edit.text(), "Уровни")
-        except ValueError:
-            current = []
-        if len(current) != len(from_labels):
-            current = from_labels
-        levels = [max(a, b) for a, b in zip(current, from_labels)]
-        self.levels_edit.setText(", ".join(map(str, levels)))
-        self._log(f"Метки утечки применены (train, validation, test) и сохранены: {path.name}; "
-                  "подготовленные метки сохранены отдельно.")
 
     # ------------------------------------------------------------------
     # Конфигурация из формы
@@ -2865,8 +2789,6 @@ class MainWindow(QMainWindow):
         if view == "Кривые IQ":
             return self._draw_traces(atoms)
         if self.result is None:
-            if view == "Пятна IQ" and self.leakage is not None:
-                return self._draw_leakage(self.leakage, self.leakage["atom"])
             self._message(fig, canvas, "Нажмите «Валидировать» или «Классифицировать» на вкладке «Распознавание».")
             return
         r = self.result
@@ -2985,17 +2907,6 @@ class MainWindow(QMainWindow):
             self.val_figure,
             atoms=atoms,
             data=data,
-        )
-        self.val_canvas.draw_idle()
-
-    def _draw_leakage(self, result, atom):
-        # Переключение режима — обязанность окна, не plotting.
-        self.mode_button.setChecked(True)
-
-        plotting.draw_leakage(
-            self.val_figure,
-            result=result,
-            atom=atom,
         )
         self.val_canvas.draw_idle()
 

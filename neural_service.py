@@ -14,8 +14,6 @@ neural_service.py — нейросетевой backend Q-Net Lab. В файле 
 * фильтры: временное окно, свёрточный фильтр с настраиваемым ядром,
   согласованные фильтры состояний (QMF), распада (RMF) и возбуждения (EMF)
   по статье Mude et al. — :meth:`apply_filters`, :meth:`filter_diagnostics`;
-* поиск естественной утечки в |2⟩ спектральной кластеризацией —
-  :meth:`find_leakage`;
 * обучение и дообучение с настройкой оптимизатора — :meth:`train`;
 * валидация с бенчмарками — :meth:`validate`;
 * классификация новых данных — :meth:`infer`;
@@ -60,7 +58,6 @@ neural_service.py — нейросетевой backend Q-Net Lab. В файле 
 ====================================================================
 * MTV (mean trace value, §V-A): временное среднее трассы, одна точка IQ на
   трассу. Это и есть «пятна» на графиках.
-* Спектральная кластеризация MTV для поиска естественной утечки (§V-A).
 * MF: K = (μ1 − μ0) / (σ1² − σ0²) (§V-B). ОТЛИЧИЕ: при σ0 ≈ σ1 разность
   дисперсий близка к нулю и меняет знак (ядро «взрывается»), поэтому здесь
   используется регуляризованная СУММА дисперсий, отдельно для I и для Q
@@ -618,13 +615,6 @@ class NeuralService:
             if np.any(labels < 0):
                 raise ValueError("labels должны быть неотрицательными целыми числами.")
             result["labels"] = labels
-        # Подготовленные метки до разметки утечки (если окно её применило):
-        # физическая диагностика считается по подготовке, а не по псевдометкам.
-        if data.get("prepared_labels") is not None:
-            prepared = NeuralService._int_array(data["prepared_labels"], "prepared_labels")
-            if prepared.shape != (n, a):
-                raise ValueError("prepared_labels должны иметь форму [N, A].")
-            result["prepared_labels"] = prepared
         if data.get("time_ns") is not None:
             time_ns = np.asarray(data["time_ns"], dtype=float).ravel()
             if time_ns.shape != (t,) or not np.isfinite(time_ns).all() or np.any(np.diff(time_ns) <= 0):
@@ -794,7 +784,7 @@ class NeuralService:
                 if len(sel) < 2:
                     raise ValueError(
                         f"В обучающей выборке для атома {config['atoms'][a]} нет хотя бы двух трасс уровня {s}. "
-                        "Уменьшите число уровней, добавьте данные или выполните «Поиск утечки».")
+                        "Уменьшите число уровней или добавьте данные.")
                 mean, vi, vq, _ = self._moments(traces(sel, a))
                 means.append(mean.astype(np.complex64))
                 var_i.append(vi)
@@ -967,135 +957,6 @@ class NeuralService:
     def kernel_name(d) -> str:
         """Подпись фильтра для таблиц и графиков: «QMF 0→1»."""
         return f"{d['kind']} {d['source']}→{d['target']}" + ("" if d["available"] else " (н/д)")
-
-    # ------------------------------------------------------------------
-    # Поиск естественной утечки (§V-A статьи)
-    # ------------------------------------------------------------------
-    def find_leakage(self, data, atom, *, indices=None, n_clusters=3, max_points=2000, seed=0) -> dict:
-        """Найти трассы, вероятно утёкшие в уровень вне вычислительного базиса.
-
-        Метод статьи (§V-A): MTV-точки трасс атома кластеризуются спектральной
-        кластеризацией на ``n_clusters`` кластеров. Затем кластеры
-        сопоставляются подготовленным состояниям 0…k−2 так, чтобы максимально
-        совпадать с метками подготовки (венгерский алгоритм по таблице
-        сопряжённости — «маркировка по вероятности утечки при подготовке
-        вычислительного состояния»). Оставшийся кластер считается утечкой в
-        уровень ``n_clusters − 1`` (обычно |2⟩).
-
-        Это ГИПОТЕЗА, а не измерение (статья: наименьший кластер лишь
-        «вероятно» соответствует утечке). Поэтому проверяется правдоподобие:
-        кластер утечки самый маленький, ни для одной подготовки не составляет
-        большинства и чаще встречается после |1⟩, чем после |0⟩; нарушения
-        возвращаются в ``warnings``. Метод возвращает предложенные метки и
-        отчёт, окно показывает их пользователю и применяет только после
-        подтверждения. Данные и метки на месте не изменяются.
-
-        Реализация спектральной кластеризации (без scikit-learn):
-        RBF-аффинность W_ij = exp(−|m_i − m_j|²/(2s²)), s — медиана попарных
-        расстояний (параметр в статье не указан — это выбор реализации);
-        нормированная матрица D^{-1/2} W D^{-1/2}; k старших собственных
-        векторов; нормировка строк; k-means. Чтобы не строить матрицу N×N
-        на всех данных, кластеризуется подвыборка ≤ max_points, остальные
-        точки относятся к ближайшему центру кластера в плоскости IQ.
-
-        :param atom: номер канала в данных.
-        :returns: ``{"labels": новые метки атома [N] (для indices),
-            "indices", "cluster_sizes", "mapping", "leaked_level", "warnings",
-            "leaked_count", "agreement", "mtv"}``.
-        """
-        from scipy.cluster.vq import kmeans2
-        from scipy.optimize import linear_sum_assignment
-
-        data = self._check_data(data)
-        if data["labels"] is None:
-            raise ValueError("Для поиска утечки нужны метки подготовленных состояний.")
-        atom = self._int(atom, "atom", 0)
-        if atom >= data["iq"].shape[1]:
-            raise ValueError("Нет такого атома в данных.")
-        k = self._int(n_clusters, "Число кластеров", 2)
-        indices = self._indices(data, indices)
-        if k > len(indices):
-            raise ValueError(f"Кластеров ({k}) больше, чем трасс ({len(indices)}).")
-        mtv = self.mean_trace_value(data["iq"][indices, atom])
-        prepared = data["labels"][indices, atom]
-        rng = np.random.default_rng(seed)
-        max_points = self._int(max_points, "max_points", 2)
-        if len(indices) <= max_points:
-            sample = np.arange(len(indices))
-        else:
-            sample = np.sort(rng.choice(len(indices), max_points, replace=False))
-        pts = np.stack([mtv[sample].real, mtv[sample].imag], axis=1).astype(float)
-        diff = pts[:, None, :] - pts[None, :, :]
-        d2 = (diff ** 2).sum(-1)
-        s2 = np.median(d2[np.triu_indices(len(pts), 1)]) or 1.0
-        w = np.exp(-d2 / (2 * s2))
-        np.fill_diagonal(w, 0.0)
-        deg = w.sum(axis=1)
-        inv = 1.0 / np.sqrt(np.maximum(deg, 1e-300))
-        m = inv[:, None] * w * inv[None, :]
-        _, vectors = np.linalg.eigh(m)
-        emb = vectors[:, -k:]
-        emb /= np.maximum(np.linalg.norm(emb, axis=1, keepdims=True), 1e-300)
-        _, cluster = kmeans2(emb, k, minit="++", seed=int(seed))
-        centers = np.array([pts[cluster == c].mean(axis=0) if np.any(cluster == c) else np.full(2, np.inf)
-                            for c in range(k)])
-        allp = np.stack([mtv.real, mtv.imag], axis=1)
-        assigned = np.argmin(((allp[:, None, :] - centers[None]) ** 2).sum(-1), axis=1)
-        # Сопоставление кластеров подготовленным уровням 0…k−2.
-        computational = list(range(k - 1))
-        table = np.array([[np.sum((assigned == c) & (prepared == s)) for c in range(k)] for s in computational])
-        rows, cols = linear_sum_assignment(-table)
-        mapping = {int(c): int(s) for s, c in zip(rows, cols)}
-        leaked_clusters = [c for c in range(k) if c not in mapping]
-        new = prepared.copy()
-        leaked = np.isin(assigned, leaked_clusters)
-        new[leaked] = k - 1
-        # Проверки правдоподобия (статья: «наименьший кластер, вероятно,
-        # утечка»). Нарушение не запрещает предложение, но выводится явно.
-        warnings = []
-        sizes = [int(np.sum(assigned == c)) for c in range(k)]
-        for c in leaked_clusters:
-            if sizes[c] != min(sizes):
-                warnings.append(f"Кластер утечки {c} не самый маленький ({sizes[c]} из {sizes}).")
-            for s in computational:
-                prepared_s = prepared == s
-                if prepared_s.any() and np.mean(assigned[prepared_s] == c) > 0.5:
-                    warnings.append(f"Кластер утечки {c} содержит большинство трасс, подготовленных в |{s}⟩.")
-            if k >= 3 and np.any(prepared == 0) and np.any(prepared == 1):
-                if np.mean(assigned[prepared == 1] == c) < np.mean(assigned[prepared == 0] == c):
-                    warnings.append(f"Кластер утечки {c} чаще встречается после подготовки |0⟩, чем |1⟩ — "
-                                    "для утечки из |1⟩ в |2⟩ ожидается обратное.")
-        if np.any(prepared >= k - 1):
-            warnings.append(f"В метках уже есть уровень ≥ {k - 1}: проверьте, нужен ли поиск утечки.")
-        return dict(labels=new, indices=indices, mtv=mtv, clusters=assigned, warnings=warnings,
-                    centers=centers, atom=atom,
-                    cluster_sizes=[int(np.sum(assigned == c)) for c in range(k)],
-                    mapping=mapping, leaked_clusters=leaked_clusters, leaked_level=k - 1,
-                    leaked_count=int(leaked.sum()),
-                    agreement=float(np.mean(np.array([mapping.get(int(c), -1) for c in assigned])[~leaked]
-                                            == prepared[~leaked])) if np.any(~leaked) else None)
-
-    def leakage_labels(self, data, proposal: dict, indices) -> np.ndarray:
-        """Применить ГОТОВОЕ предложение :meth:`find_leakage` к другим измерениям.
-
-        Кластеризация заново не выполняется: каждая MTV-точка относится к
-        ближайшему центру найденных кластеров (так же, как точки вне
-        подвыборки в find_leakage). Нужна, чтобы отложенный test получил ту же
-        разметку, что train, и метрики на нём оставались сопоставимыми.
-
-        :returns: новые метки атома для ``indices``.
-        """
-        data = self._check_data(data)
-        if data["labels"] is None:
-            raise ValueError("Для разметки утечки нужны метки подготовленных состояний.")
-        indices = self._indices(data, indices)
-        atom = proposal["atom"]
-        mtv = self.mean_trace_value(data["iq"][indices, atom])
-        pts = np.stack([mtv.real, mtv.imag], axis=1)
-        assigned = np.argmin(((pts[:, None, :] - proposal["centers"][None]) ** 2).sum(-1), axis=1)
-        labels = data["labels"][indices, atom].copy()
-        labels[np.isin(assigned, proposal["leaked_clusters"])] = proposal["leaked_level"]
-        return labels
 
     # ------------------------------------------------------------------
     # Сеть
